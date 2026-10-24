@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, Any, List
 
-from ai_analyzer import call_venice_market_audit
+from ai_analyzer import call_venice_market_audit, get_ai_health
 from telegram_notifier import send_telegram_alert
 from polymarket_scanner import (
     fetch_polymarket_markets,
@@ -173,6 +173,9 @@ def step_simulation() -> Dict[str, Any]:
     except Exception:
         hl_map = {}
 
+    ai_health = get_ai_health()
+    is_emergency = ai_health.get("emergency_mode", False)
+
     for pos in state["positions"]:
         alloc = float(pos["allocated_usd"])
 
@@ -183,50 +186,97 @@ def step_simulation() -> Dict[str, Any]:
                 prices = [float(p) for p in (json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw)]
                 new_mid = prices[0] if prices else pos["current_mid"]
                 hr_move = abs(float(m.get("oneHourPriceChange") or 0.0))
+            else:
+                new_mid = pos["current_mid"]
+                hr_move = 0.0
 
-                # Проверяем: не пробила ли реальная цена наши лимитные ордера?
-                if new_mid <= pos["bid_limit"] or new_mid >= pos["ask_limit"]:
-                    breach = max(pos["bid_limit"] - new_mid, new_mid - pos["ask_limit"], 0.002)
-                    penalty = round(alloc * breach, 4)
-                    pos["adverse_loss_usd"] = round(pos["adverse_loss_usd"] + penalty, 4)
-                    pos["rebalances_count"] += 1
-                    half_c = (pos["max_spread_cents"] / 100.0) * 0.65
-                    pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
-                    pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
+            if is_emergency:
+                # В аварийном режиме (нет связи с Venice AI) включаем защитную паузу:
+                # снимаем лимитки из стакана, чтобы информированные игроки не выкупили их на токсичном потоке
+                if not pos.get("mm_defensive_paused", False):
+                    pos["mm_defensive_paused"] = True
                     log_event(
-                        f"⚠️ ПРОБОЙ КОРИДОРА [{pos['title'][:40]}]: цена {new_mid:.4f}, списан убыток -${penalty:.2f}, ордера переставлены."
-                    )
-                    send_telegram_alert(
-                        f"⚠️ <b>Пробой коридора Polymarket!</b>\n"
-                        f"Рынок: <i>{pos['title']}</i>\n"
-                        f"Новая цена: <code>{new_mid:.4f}</code>\n"
-                        f"Списан убыток пробоя: <b>-${penalty:.2f} USDC</b>\n"
-                        f"Лимитки переставлены: <code>{pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f}</code>"
-                    )
-                elif hr_move >= 0.012 or abs(new_mid - pos["current_mid"]) >= 0.01:
-                    # Срабатывание ИИ-защиты до пробоя лимиток
-                    pos["rebalances_count"] += 1
-                    half_c = (pos["max_spread_cents"] / 100.0) * 0.65
-                    pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
-                    pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
-                    log_event(
-                        f"🛡️ ИИ-ЗАЩИТА [{pos['title'][:40]}]: замечено движение цены ({pos['current_mid']:.4f} -> {new_mid:.4f}), лимитки безопасно сдвинуты."
-                    )
-                    send_telegram_alert(
-                        f"🛡️ <b>Сработал ИИ Kill-Switch!</b>\n"
-                        f"Рынок: <i>{pos['title']}</i>\n"
-                        f"Цена сдвинулась: <code>{pos['current_mid']:.4f} -> {new_mid:.4f}</code>\n"
-                        f"Лимитки безопасно сдвинуты без потерь."
+                        f"🛡️ [АВАРИЙНЫЙ РЕЖИМ] {pos['title'][:35]}: лимитки сняты для защиты капитала."
                     )
                 pos["current_mid"] = new_mid
+                continue
+
+            # Если аварийный режим был снят — возвращаем лимитные ордера в стакан
+            if pos.get("mm_defensive_paused", False):
+                pos["mm_defensive_paused"] = False
+                half_c = (pos["max_spread_cents"] / 100.0) * 0.65
+                pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
+                pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
+                log_event(
+                    f"✅ [ШТАТНЫЙ РЕЖИМ] {pos['title'][:35]}: лимитки возвращены в стакан ({pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f})."
+                )
+
+            # Проверяем: не пробила ли реальная цена наши лимитные ордера?
+            if new_mid <= pos["bid_limit"] or new_mid >= pos["ask_limit"]:
+                breach = max(pos["bid_limit"] - new_mid, new_mid - pos["ask_limit"], 0.002)
+                penalty = round(alloc * breach, 4)
+                pos["adverse_loss_usd"] = round(pos["adverse_loss_usd"] + penalty, 4)
+                pos["rebalances_count"] += 1
+                half_c = (pos["max_spread_cents"] / 100.0) * 0.65
+                pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
+                pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
+                log_event(
+                    f"⚠️ ПРОБОЙ КОРИДОРА [{pos['title'][:40]}]: цена {new_mid:.4f}, списан убыток -${penalty:.2f}, ордера переставлены."
+                )
+                send_telegram_alert(
+                    f"⚠️ <b>Пробой коридора Polymarket!</b>\n"
+                    f"Рынок: <i>{pos['title']}</i>\n"
+                    f"Новая цена: <code>{new_mid:.4f}</code>\n"
+                    f"Списан убыток пробоя: <b>-${penalty:.2f} USDC</b>\n"
+                    f"Лимитки переставлены: <code>{pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f}</code>"
+                )
+            elif hr_move >= 0.012 or abs(new_mid - pos["current_mid"]) >= 0.01:
+                # Срабатывание ИИ-защиты до пробоя лимиток
+                pos["rebalances_count"] += 1
+                half_c = (pos["max_spread_cents"] / 100.0) * 0.65
+                pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
+                pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
+                log_event(
+                    f"🛡️ ИИ-ЗАЩИТА [{pos['title'][:40]}]: замечено движение цены ({pos['current_mid']:.4f} -> {new_mid:.4f}), лимитки безопасно сдвинуты."
+                )
+                send_telegram_alert(
+                    f"🛡️ <b>Сработал ИИ Kill-Switch!</b>\n"
+                    f"Рынок: <i>{pos['title']}</i>\n"
+                    f"Цена сдвинулась: <code>{pos['current_mid']:.4f} -> {new_mid:.4f}</code>\n"
+                    f"Лимитки безопасно сдвинуты без потерь."
+                )
+            pos["current_mid"] = new_mid
 
             # Начисляем реальные Liquidity Rewards за прошедшее время
             reward_gain = alloc * (float(pos["expected_apr"]) / 100.0) * elapsed_years
             pos["accrued_rewards_usd"] = round(pos["accrued_rewards_usd"] + reward_gain, 4)
 
         elif pos["type"] == "poly_bond":
-            gain = alloc * (float(pos["expected_apr"]) / 100.0) * elapsed_years
-            pos["accrued_rewards_usd"] = round(pos["accrued_rewards_usd"] + gain, 4)
+            # Ищем актуальную цену бонда на Polymarket
+            q_clean = pos.get("title", "").split(" [")[0]
+            m = by_q.get(q_clean)
+            if m:
+                prices_raw = m.get("outcomePrices") or '["0.5", "0.5"]'
+                prices = [float(p) for p in (json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw)]
+                cur_price = prices[1] if pos.get("outcome") == "No" and len(prices) > 1 else prices[0]
+                pos["current_price"] = cur_price
+
+                # Если в аварийном режиме цена бонда падает ниже 95.0¢ — срабатывает жесткий Stop-Loss
+                if is_emergency and cur_price < 0.95 and pos.get("status") != "STOPPED_OUT":
+                    loss = round(alloc * (1.0 - cur_price), 4)
+                    pos["adverse_loss_usd"] = round(pos["adverse_loss_usd"] + loss, 4)
+                    pos["status"] = "STOPPED_OUT"
+                    log_event(f"🚨 [STOP-LOSS] Экстренный сброс бонда {pos['title']} по ${cur_price:.4f}! Убыток: -${loss:.2f}")
+                    send_telegram_alert(
+                        f"🚨 <b>Аварийный Stop-Loss бонда!</b>\n"
+                        f"Позиция: <i>{pos['title']}</i>\n"
+                        f"Цена просела до: <code>{cur_price:.4f}</code>\n"
+                        f"Позиция ликвидирована для защиты капитала (убыток: -${loss:.2f})."
+                    )
+
+            if pos.get("status") != "STOPPED_OUT":
+                gain = alloc * (float(pos["expected_apr"]) / 100.0) * elapsed_years
+                pos["accrued_rewards_usd"] = round(pos["accrued_rewards_usd"] + gain, 4)
 
         elif pos["type"] == "hl_funding":
             coin = pos["coin"]
@@ -243,6 +293,7 @@ def step_simulation() -> Dict[str, Any]:
 
     state["last_tick_at"] = now
     state["ticks_count"] = int(state.get("ticks_count", 0)) + 1
+    state["emergency_mode"] = is_emergency
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
     total_rewards = sum(p["accrued_rewards_usd"] for p in state["positions"])

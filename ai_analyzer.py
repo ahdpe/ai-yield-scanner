@@ -8,6 +8,10 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, Any, List
 
+from telegram_notifier import send_telegram_alert
+
+
+AI_HEALTH_FILE = Path("state/ai_health.json")
 
 SPORTS_KEYWORDS = [
     r"\bvs\.?\b", r"\bbo1\b", r"\bbo3\b", r"\bbo5\b", r"\bufc\b",
@@ -38,6 +42,116 @@ def load_venice_api_key() -> str:
             if line.startswith("VENICE_API_KEY="):
                 return line.split("=", 1)[1].strip().strip("\"'")
     return ""
+
+
+def get_ai_health() -> Dict[str, Any]:
+    """Возвращает текущий статус здоровья подключения к Venice AI."""
+    if AI_HEALTH_FILE.exists():
+        try:
+            return json.loads(AI_HEALTH_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "status": "HEALTHY",
+        "consecutive_failures": 0,
+        "last_success_ts": time.time(),
+        "last_failure_ts": 0,
+        "last_error": "",
+        "last_latency_sec": 0.0,
+        "emergency_mode": False,
+        "emergency_since": 0,
+    }
+
+
+def update_ai_health(success: bool, error: str = "", latency: float = 0.0) -> Dict[str, Any]:
+    """Обновляет статус здоровья подключения к Venice AI и при необходимости включает аварийный режим."""
+    health = get_ai_health()
+    now = time.time()
+    AI_HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if not success:
+        health["consecutive_failures"] = int(health.get("consecutive_failures", 0)) + 1
+        health["last_failure_ts"] = now
+        health["last_error"] = error
+        if latency > 0:
+            health["last_latency_sec"] = round(latency, 2)
+
+        # При 2 и более последовательных ошибках активируем аварийный режим
+        if health["consecutive_failures"] >= 2 and not health.get("emergency_mode", False):
+            health["emergency_mode"] = True
+            health["emergency_since"] = now
+            health["status"] = "EMERGENCY"
+            send_telegram_alert(
+                "🚨 <b>АВАРИЙНЫЙ РЕЖИМ АКТИВИРОВАН!</b>\n\n"
+                "❌ <b>Потеряна связь с Venice AI!</b>\n"
+                f"Ошибка: <code>{error[:120]}</code>\n"
+                f"Ошибок подряд: <code>{health['consecutive_failures']}</code>\n\n"
+                "🛡 <b>Защитный протокол вступил в силу:</b>\n"
+                "• Все новые сделки заблокированы (Fail-Closed)\n"
+                "• MM-лимитки переведены в защитную паузу (защита от токсичного потока)\n"
+                "• Бондинг-позиции поставлены на жесткий Stop-Loss (95¢)"
+            )
+        elif health.get("emergency_mode", False):
+            health["status"] = "EMERGENCY"
+        else:
+            health["status"] = "DEGRADED"
+
+    else:
+        was_emergency = health.get("emergency_mode", False)
+        health["consecutive_failures"] = 0
+        health["last_success_ts"] = now
+        health["last_error"] = ""
+        health["last_latency_sec"] = round(latency, 2)
+        health["status"] = "HEALTHY"
+        health["emergency_mode"] = False
+        health["emergency_since"] = 0
+
+        if was_emergency:
+            send_telegram_alert(
+                "✅ <b>АВАРИЙНЫЙ РЕЖИМ СНЯТ!</b>\n\n"
+                "🟢 <b>Связь с Venice AI успешно восстановлена.</b>\n"
+                f"Задержка ответа: <code>{latency:.2f} сек</code>\n"
+                "Все торговые модули возвращены в штатный режим."
+            )
+
+    AI_HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8")
+    return health
+
+
+def ping_venice_ai() -> Dict[str, Any]:
+    """Быстрый проверочный пинг Venice AI через эндпоинт моделей (0 токенов расхода)."""
+    api_key = load_venice_api_key()
+    base_url = os.environ.get("VENICE_BASE_URL", "http://127.0.0.1:8787/api/v1")
+    url = f"{base_url.rstrip('/')}/models"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "AI-Yield-Scanner/1.0",
+        },
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            latency = time.time() - t0
+            health = update_ai_health(success=True, latency=latency)
+            return {
+                "ok": True,
+                "latency_sec": round(latency, 2),
+                "models_count": len(data.get("data", [])),
+                "health": health,
+            }
+    except Exception as exc:
+        latency = time.time() - t0
+        err_msg = str(exc)
+        health = update_ai_health(success=False, error=err_msg, latency=latency)
+        return {
+            "ok": False,
+            "latency_sec": round(latency, 2),
+            "error": err_msg,
+            "health": health,
+        }
 
 
 def classify_polymarket_risk(market: Dict[str, Any]) -> Dict[str, Any]:
@@ -103,8 +217,10 @@ def call_venice_market_audit(
     outcome_label: str = "YES",
     cache_file: str = "state/ai_audits_cache.json",
 ) -> Dict[str, Any]:
-    """Вызывает Venice AI (модель gemini-3-8-flash через локальный прокси Hermes или api.venice.ai)
-    для анализа правил рынка и принятия решения APPROVE / SKIP."""
+    """Вызывает Venice AI (модель gemini-4-argon через локальный прокси Hermes или api.venice.ai)
+    для анализа правил рынка и принятия решения APPROVE / SKIP.
+    
+    В аварийном режиме или при сбое сети строго соблюдается принцип Fail-Closed (вход блокируется)."""
     cache_path = Path(cache_file)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache: Dict[str, Any] = {}
@@ -122,11 +238,14 @@ def call_venice_market_audit(
 
     api_key = load_venice_api_key()
     if not api_key:
+        update_ai_health(success=False, error="Ключ VENICE_API_KEY не найден локально")
         return {
-            "decision": "APPROVE",
-            "confidence": 75,
-            "summary": "Эвристический допуск (ключ VENICE_API_KEY не найден локально).",
+            "decision": "SKIP",
+            "confidence": 0,
+            "summary": "Аварийная блокировка (Fail-Closed): VENICE_API_KEY не найден.",
             "watch_keywords": [],
+            "emergency_mode": True,
+            "model_used": "none",
         }
 
     base_url = os.environ.get("VENICE_BASE_URL", "http://127.0.0.1:8787/api/v1")
@@ -164,9 +283,13 @@ def call_venice_market_audit(
             "User-Agent": "AI-Yield-Scanner/1.0",
         },
     )
+
+    t0 = time.time()
+    last_err = ""
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+            latency = time.time() - t0
             raw_text = (data["choices"][0]["message"].get("content") or "").strip()
             match = re.search(r"\{.*\}", raw_text, re.DOTALL)
             if not match:
@@ -178,16 +301,23 @@ def call_venice_market_audit(
                 "summary": parsed.get("summary", ""),
                 "watch_keywords": parsed.get("watch_keywords", []),
                 "model_used": data.get("model", model),
+                "emergency_mode": False,
             }
             cache[cache_key] = {"ts": now, "result": result}
             cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            update_ai_health(success=True, latency=latency)
             return result
     except Exception as exc:
+        latency = time.time() - t0
         last_err = str(exc)
+        update_ai_health(success=False, error=last_err, latency=latency)
 
+    # Принцип закрытого отказа (Fail-Closed): ни при каких обстоятельствах не входить вслепую
     return {
-        "decision": "APPROVE",
-        "confidence": 70,
-        "summary": f"Резервный эвристический фильтр (ответ прокси: {last_err[:80]})",
+        "decision": "SKIP",
+        "confidence": 0,
+        "summary": f"Аварийный отказ (Fail-Closed): нет связи с Venice AI ({last_err[:80]}). Вход строго заблокирован.",
         "watch_keywords": [],
+        "emergency_mode": True,
+        "model_used": "none (circuit-breaker)",
     }
