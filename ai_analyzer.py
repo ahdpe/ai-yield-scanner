@@ -21,6 +21,9 @@ DEFAULT_AI_CACHE_FILE = STATE_DIR / "ai_audits_cache.json"
 MIN_APPROVE_CONFIDENCE = 70
 # Жесткий потолок платных вызовов Venice в сутки (UTC): ~0.003 DIEM за вызов → ≤0.12 DIEM/день
 MAX_AI_CALLS_PER_DAY = int(os.environ.get("AI_MAX_CALLS_PER_DAY", "40"))
+# Часть суточного лимита, недоступная для новых входов: остается под повторные аудиты открытых позиций
+# (4 позиции Polymarket × аудит раз в 6 ч = 16 вызовов в сутки)
+REAUDIT_RESERVE_CALLS = int(os.environ.get("AI_REAUDIT_RESERVE_CALLS", "16"))
 
 SPORTS_KEYWORDS = [
     r"\bvs\.?\b", r"\bbo1\b", r"\bbo3\b", r"\bbo5\b", r"\bufc\b",
@@ -218,8 +221,9 @@ def classify_polymarket_risk(market: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _consume_ai_call_budget() -> bool:
-    """Учитывает платный вызов Venice в суточном лимите. False — лимит на сегодня исчерпан."""
+def _consume_ai_call_budget(reserve: int = 0) -> bool:
+    """Учитывает платный вызов Venice в суточном лимите. False — лимит на сегодня исчерпан.
+    reserve — сколько вызовов из лимита этому вызывающему трогать нельзя (они оставлены под другие задачи)."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     budget: Dict[str, Any] = {}
     if AI_BUDGET_FILE.exists():
@@ -229,7 +233,7 @@ def _consume_ai_call_budget() -> bool:
             budget = {}
     if budget.get("date") != today:
         budget = {"date": today, "calls": 0}
-    if budget["calls"] >= MAX_AI_CALLS_PER_DAY:
+    if budget["calls"] >= MAX_AI_CALLS_PER_DAY - reserve:
         return False
     budget["calls"] += 1
     atomic_write_json(AI_BUDGET_FILE, budget)
@@ -246,7 +250,12 @@ def get_ai_budget() -> Dict[str, Any]:
             calls = int(b.get("calls", 0)) if b.get("date") == today else 0
         except Exception:
             pass
-    return {"date": today, "calls": calls, "limit": MAX_AI_CALLS_PER_DAY}
+    return {"date": today, "calls": calls, "limit": MAX_AI_CALLS_PER_DAY, "reserve": REAUDIT_RESERVE_CALLS}
+
+
+def entry_budget_exhausted() -> bool:
+    """Исчерпана ли часть суточного лимита, доступная для новых входов (без резерва под повторные аудиты)."""
+    return get_ai_budget()["calls"] >= MAX_AI_CALLS_PER_DAY - REAUDIT_RESERVE_CALLS
 
 
 STRATEGY_BRIEFS = {
@@ -347,12 +356,14 @@ def call_venice_market_audit(
     cache_file: str = "",
     samples: int = 1,
     cache_ttl_sec: float = 10800,
+    budget_reserve: int = 0,
 ) -> Dict[str, Any]:
     """Вызывает Venice AI для анализа правил рынка и принятия решения APPROVE / SKIP.
 
     samples > 1 — консенсус: APPROVE только если все выборки одобрили (сглаживает недетерминизм модели).
     В аварийном режиме, при сбое сети или исчерпании суточного лимита строго соблюдается Fail-Closed (вход блокируется).
-    Поле "audited_at" меняется только при свежем аудите (по нему можно отличить кэш от нового вердикта)."""
+    Поле "audited_at" меняется только при свежем аудите (по нему можно отличить кэш от нового вердикта).
+    budget_reserve — сколько вызовов суточного лимита не трогать (для новых входов: резерв под повторные аудиты)."""
     cache_path = Path(cache_file) if cache_file else DEFAULT_AI_CACHE_FILE
     cache: Dict[str, Any] = {}
     if cache_path.exists():
@@ -385,11 +396,17 @@ def call_venice_market_audit(
     votes: List[Dict[str, Any]] = []
     last_err = ""
     for _ in range(max(1, samples)):
-        if not _consume_ai_call_budget():
+        if not _consume_ai_call_budget(budget_reserve):
+            summary = (
+                f"Лимит вызовов Venice на новые входы ({MAX_AI_CALLS_PER_DAY - budget_reserve} из {MAX_AI_CALLS_PER_DAY}) исчерпан — "
+                f"входы заблокированы до 00:00 UTC, резерв {budget_reserve} вызовов оставлен под повторные аудиты."
+                if budget_reserve else
+                f"Суточный лимит вызовов Venice ({MAX_AI_CALLS_PER_DAY}) исчерпан до 00:00 UTC."
+            )
             return {
                 "decision": "SKIP",
                 "confidence": 0,
-                "summary": f"Суточный лимит вызовов Venice ({MAX_AI_CALLS_PER_DAY}) исчерпан — новые входы заблокированы до 00:00 UTC.",
+                "summary": summary,
                 "watch_keywords": [],
                 "emergency_mode": False,
                 "budget_exhausted": True,

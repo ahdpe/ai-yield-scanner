@@ -201,7 +201,8 @@ def format_settings_msg() -> str:
     return (
         "⚙️ <b>НАСТРОЙКИ СИСТЕМЫ</b>\n\n"
         f"🤖 <b>Модель Venice AI:</b> <code>{esc(model)}</code> (консенсус 2/2 при входе)\n"
-        f"💳 <b>Вызовов ИИ сегодня:</b> {budget['calls']} из {budget['limit']} (~0.003 DIEM за вызов)\n"
+        f"💳 <b>Вызовов ИИ сегодня:</b> {budget['calls']} из {budget['limit']} (~0.003 DIEM за вызов; "
+        f"{budget['reserve']} зарезервировано под повторные аудиты)\n"
         f"🔔 <b>Push-алерты:</b> {alerts}\n"
         f"📐 <b>Формула ревардов MM:</b> Квадратичная по живому стакану CLOB\n"
         f"💼 <b>Размер депозита:</b> ${deposit:,.0f} USDC (5 слотов по ${slot_sz:,.0f})\n"

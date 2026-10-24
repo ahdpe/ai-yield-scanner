@@ -6,9 +6,15 @@ from datetime import datetime, timezone
 import json
 import time
 import traceback
-from typing import Dict, Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ai_analyzer import call_venice_market_audit, get_ai_health, ping_venice_ai
+from ai_analyzer import (
+    REAUDIT_RESERVE_CALLS,
+    call_venice_market_audit,
+    entry_budget_exhausted,
+    get_ai_health,
+    ping_venice_ai,
+)
 from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
 from polymarket_scanner import (
@@ -37,6 +43,7 @@ AI_SKIP_STREAK_TO_CLOSE = 2       # закрываем позицию после
 HL_ADVERSE_TICKS_TO_CLOSE = 2     # закрываем фандинг после двух тиков с разворотом знака
 MAX_ACCRUAL_GAP_SEC = 3600        # дольше часа без наблюдения рынка доход не начисляем
 REOPEN_COOLDOWN_SEC = 12 * 3600   # не переоткрываем закрытый рынок в течение 12 часов
+REFILL_FRESH_AUDITS_PER_STRATEGY = 1  # за тик — не больше 1 нового кандидата на стратегию (≤3 платных проверки)
 MM_SPREAD_FRACTION = 0.65         # отступ наших лимиток от mid в долях rewardsMaxSpread
 
 
@@ -138,20 +145,29 @@ def hl_funding_brief(c: Dict[str, Any]) -> str:
     )
 
 
-def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Optional[Dict[str, Any]]:
+def _is_cached_verdict(audit: Dict[str, Any], now: float) -> bool:
+    """Вердикт взят из кэша аудитов (не свежий и не служебный отказ по бюджету/связи)."""
+    if str(audit.get("model_used", "")).startswith("none"):
+        return False
+    return float(audit.get("audited_at") or 0.0) < now
+
+
+def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     audit = call_venice_market_audit(
         question=item["question"],
         description=item["description"],
         price_yes=item["price_yes"],
         strategy_type="polymarket_liquidity_maker",
         samples=ENTRY_AI_SAMPLES,
+        budget_reserve=REAUDIT_RESERVE_CALLS,
     )
-    log_event(
-        f"Venice AI ({audit.get('model_used', 'local')}) аудит [{item['question'][:48]}...]: "
-        f"{audit['decision']} (conf={audit['confidence']}%) — {audit['summary']}"
-    )
+    if not _is_cached_verdict(audit, now):  # кэшированные SKIP не дублируем в логе каждый тик
+        log_event(
+            f"Venice AI ({audit.get('model_used', 'local')}) аудит [{item['question'][:48]}...]: "
+            f"{audit['decision']} (conf={audit['confidence']}%) — {audit['summary']}"
+        )
     if audit["decision"] != "APPROVE":
-        return None
+        return None, audit
 
     mid = item["price_yes"]
     return {
@@ -179,10 +195,10 @@ def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Optiona
         "rebalances_count": 0,
         "ai_audit": audit,
         "last_audit_ts": audit.get("audited_at"),
-    }
+    }, audit
 
 
-def _open_bond_slot(b: Dict[str, Any], slot_size: float, now: float) -> Optional[Dict[str, Any]]:
+def _open_bond_slot(b: Dict[str, Any], slot_size: float, now: float) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     audit = call_venice_market_audit(
         question=b["question"],
         description=b["description"],
@@ -190,13 +206,15 @@ def _open_bond_slot(b: Dict[str, Any], slot_size: float, now: float) -> Optional
         strategy_type="polymarket_smart_bonding",
         outcome_label=b["lead_outcome"],
         samples=ENTRY_AI_SAMPLES,
+        budget_reserve=REAUDIT_RESERVE_CALLS,
     )
-    log_event(
-        f"Venice AI бондинг-аудит [{b['question'][:48]}...]: "
-        f"{audit['decision']} (conf={audit['confidence']}%) — {audit['summary']}"
-    )
+    if not _is_cached_verdict(audit, now):  # кэшированные SKIP не дублируем в логе каждый тик
+        log_event(
+            f"Venice AI бондинг-аудит [{b['question'][:48]}...]: "
+            f"{audit['decision']} (conf={audit['confidence']}%) — {audit['summary']}"
+        )
     if audit["decision"] != "APPROVE":
-        return None
+        return None, audit
 
     return {
         "id": f"bond_{b['question'][:24]}",
@@ -217,10 +235,10 @@ def _open_bond_slot(b: Dict[str, Any], slot_size: float, now: float) -> Optional
         "unrealized_pnl_usd": 0.0,
         "ai_audit": audit,
         "last_audit_ts": audit.get("audited_at"),
-    }
+    }, audit
 
 
-def _open_hl_slot(c: Dict[str, Any], slot_size: float, now: float) -> Optional[Dict[str, Any]]:
+def _open_hl_slot(c: Dict[str, Any], slot_size: float, now: float) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     direction = "SHORT" if c["current_apr"] > 0 else "LONG"
     audit = call_venice_market_audit(
         question=f"Hyperliquid {c['coin']} funding carry ({direction} perp)",
@@ -229,13 +247,15 @@ def _open_hl_slot(c: Dict[str, Any], slot_size: float, now: float) -> Optional[D
         strategy_type="hyperliquid_funding",
         outcome_label=direction,
         samples=ENTRY_AI_SAMPLES,
+        budget_reserve=REAUDIT_RESERVE_CALLS,
     )
-    log_event(
-        f"Venice AI фандинг-аудит [Hyperliquid {c['coin']} {direction}]: "
-        f"{audit['decision']} (conf={audit['confidence']}%) — {audit['summary']}"
-    )
+    if not _is_cached_verdict(audit, now):  # кэшированные SKIP не дублируем в логе каждый тик
+        log_event(
+            f"Venice AI фандинг-аудит [Hyperliquid {c['coin']} {direction}]: "
+            f"{audit['decision']} (conf={audit['confidence']}%) — {audit['summary']}"
+        )
     if audit["decision"] != "APPROVE":
-        return None
+        return None, audit
 
     entry_fee = round(slot_size * HL_FEE_RATE, 4)
     spot = c.get("spot_hedge") or {}
@@ -255,7 +275,7 @@ def _open_hl_slot(c: Dict[str, Any], slot_size: float, now: float) -> Optional[D
         "adverse_loss_usd": entry_fee,
         "adverse_ticks": 0,
         "ai_audit": audit,
-    }
+    }, audit
 
 
 def init_portfolio(deposit_usd: float = 5000.0) -> Dict[str, Any]:
@@ -274,20 +294,20 @@ def init_portfolio(deposit_usd: float = 5000.0) -> Dict[str, Any]:
     for item in reward_candidates:
         if len([p for p in positions if p["type"] == "poly_mm"]) >= 3:
             break
-        pos = _open_mm_slot(item, slot_size, now)
+        pos, _ = _open_mm_slot(item, slot_size, now)
         if pos:
             positions.append(pos)
 
     # Слот 4: Polymarket Smart Bonding ($1,000)
     for b in bonding_candidates:
-        pos = _open_bond_slot(b, slot_size, now)
+        pos, _ = _open_bond_slot(b, slot_size, now)
         if pos:
             positions.append(pos)
             break
 
     # Слот 5: Hyperliquid Funding Anomaly ($1,000) — только со спот-хеджем на Hyperliquid и после аудита ИИ
     for c in hl_candidates[:3]:
-        pos = _open_hl_slot(c, slot_size, now)
+        pos, _ = _open_hl_slot(c, slot_size, now)
         if pos:
             positions.append(pos)
             log_event(f"Открыт слот Hyperliquid {c['coin']} (списана комиссия входа -${pos['adverse_loss_usd']:.2f}).")
@@ -336,55 +356,82 @@ def refill_open_slots(
     open_bond = len([p for p in open_pos if p["type"] == "poly_bond"])
     open_hl = len([p for p in open_pos if p["type"] == "hl_funding"])
 
-    # За один тик открываем не более 1 новой позиции, чтобы не жечь суточный бюджет Venice AI
-    if poly_ok and open_mm < 3:
-        for item in scan_liquidity_rewards(markets, deposit_usd=slot_size, min_safety_score=75):
-            if item["slug"] in blocked_slugs:
+    if entry_budget_exhausted():
+        return  # лимит ИИ на новые входы на сегодня исчерпан — даже не сканируем рынки
+
+    def try_candidates(
+        candidates: List[Dict[str, Any]],
+        opener: Callable[[Dict[str, Any], float, float], Tuple[Optional[Dict[str, Any]], Dict[str, Any]]],
+        is_blocked: Callable[[Dict[str, Any]], bool],
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Перебирает кандидатов одной стратегии, делая не больше REFILL_FRESH_AUDITS_PER_STRATEGY свежих аудитов ИИ.
+        Кэшированные вердикты бесплатны и в лимит не входят. Возвращает (открытая позиция, продолжать ли с другими стратегиями)."""
+        fresh = 0
+        for cand in candidates:
+            if is_blocked(cand):
                 continue
-            pos = _open_mm_slot(item, slot_size, now)
+            pos, audit = opener(cand, slot_size, now)
             if pos:
-                state["positions"].append(pos)
-                log_event(f"♻️ Перераспределение капитала: открыт новый MM-слот [{pos['title'][:45]}] с квадратичным APR {pos['expected_apr']:.1f}%.")
-                send_telegram_alert(
-                    f"♻️ <b>Открыт новый MM-слот ($1,000)</b>\n"
-                    f"Рынок: <i>{esc(pos['title'])}</i>\n"
-                    f"Честный квадратичный APR (CLOB): <code>{pos['expected_apr']:.1f}%</code>"
-                )
-                return
+                return pos, True
+            if audit.get("budget_exhausted") or audit.get("emergency_mode"):
+                return None, False  # лимит на входы исчерпан или нет связи с Venice — до следующего тика
+            if float(audit.get("audited_at") or 0.0) >= now:
+                fresh += 1
+                if fresh >= REFILL_FRESH_AUDITS_PER_STRATEGY:
+                    break
+        return None, True
+
+    # За один тик открываем не более 1 новой позиции и делаем не более 1 свежего аудита на стратегию
+    if poly_ok and open_mm < 3:
+        pos, go_on = try_candidates(
+            scan_liquidity_rewards(markets, deposit_usd=slot_size, min_safety_score=75),
+            _open_mm_slot,
+            lambda c: c["slug"] in blocked_slugs,
+        )
+        if pos:
+            state["positions"].append(pos)
+            log_event(f"♻️ Перераспределение капитала: открыт новый MM-слот [{pos['title'][:45]}] с квадратичным APR {pos['expected_apr']:.1f}%.")
+            send_telegram_alert(
+                f"♻️ <b>Открыт новый MM-слот ($1,000)</b>\n"
+                f"Рынок: <i>{esc(pos['title'])}</i>\n"
+                f"Честный квадратичный APR (CLOB): <code>{pos['expected_apr']:.1f}%</code>"
+            )
+            return
+        if not go_on:
+            return
 
     if poly_ok and open_bond < 1:
-        for b in scan_smart_bonding(markets, deposit_usd=slot_size):
-            if b["slug"] in blocked_slugs:
-                continue
-            pos = _open_bond_slot(b, slot_size, now)
-            if pos:
-                state["positions"].append(pos)
-                log_event(f"♻️ Перераспределение капитала: открыт новый бонд [{pos['title'][:45]}] по ${pos['entry_price']:.4f}.")
-                send_telegram_alert(
-                    f"♻️ <b>Открыт новый бонд-слот ($1,000)</b>\n"
-                    f"Рынок: <i>{esc(pos['title'])}</i>\n"
-                    f"Вход: <code>{pos['entry_price']:.4f}</code> (APR к погашению: <code>{pos['expected_apr']:.1f}%</code>)"
-                )
-                return
+        pos, go_on = try_candidates(
+            scan_smart_bonding(markets, deposit_usd=slot_size),
+            _open_bond_slot,
+            lambda b: b["slug"] in blocked_slugs,
+        )
+        if pos:
+            state["positions"].append(pos)
+            log_event(f"♻️ Перераспределение капитала: открыт новый бонд [{pos['title'][:45]}] по ${pos['entry_price']:.4f}.")
+            send_telegram_alert(
+                f"♻️ <b>Открыт новый бонд-слот ($1,000)</b>\n"
+                f"Рынок: <i>{esc(pos['title'])}</i>\n"
+                f"Вход: <code>{pos['entry_price']:.4f}</code> (APR к погашению: <code>{pos['expected_apr']:.1f}%</code>)"
+            )
+            return
+        if not go_on:
+            return
 
     if hl_ok and open_hl < 1:
         try:
             hl_cands = [a for a in scan_funding_anomalies(require_hl_spot_hedge=True) if a["same_sign_pct_72h"] >= 60.0]
         except Exception:
             hl_cands = []
-        for c in hl_cands[:3]:
-            if c["coin"] in blocked_coins:
-                continue
-            pos = _open_hl_slot(c, slot_size, now)
-            if pos:
-                state["positions"].append(pos)
-                log_event(f"♻️ Перераспределение капитала: открыт новый фандинг-слот Hyperliquid {c['coin']} (APR {pos['expected_apr']:.1f}%).")
-                send_telegram_alert(
-                    f"♻️ <b>Открыт новый фандинг-слот ($1,000)</b>\n"
-                    f"Позиция: <i>{esc(pos['title'])}</i>\n"
-                    f"Чистый APR на капитал: <code>{pos['expected_apr']:.1f}%</code>"
-                )
-                return
+        pos, _ = try_candidates(hl_cands[:3], _open_hl_slot, lambda c: c["coin"] in blocked_coins)
+        if pos:
+            state["positions"].append(pos)
+            log_event(f"♻️ Перераспределение капитала: открыт новый фандинг-слот Hyperliquid {pos['coin']} (APR {pos['expected_apr']:.1f}%).")
+            send_telegram_alert(
+                f"♻️ <b>Открыт новый фандинг-слот ($1,000)</b>\n"
+                f"Позиция: <i>{esc(pos['title'])}</i>\n"
+                f"Чистый APR на капитал: <code>{pos['expected_apr']:.1f}%</code>"
+            )
 
 
 def migrate_state(
