@@ -5,13 +5,22 @@ import os
 import re
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List
 
+from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
 
 
-AI_HEALTH_FILE = Path("state/ai_health.json")
+AI_HEALTH_FILE = STATE_DIR / "ai_health.json"
+AI_BUDGET_FILE = STATE_DIR / "ai_budget.json"
+DEFAULT_AI_CACHE_FILE = STATE_DIR / "ai_audits_cache.json"
+
+# Минимальная уверенность модели, при которой APPROVE засчитывается как одобрение
+MIN_APPROVE_CONFIDENCE = 70
+# Жесткий потолок платных вызовов Venice в сутки (UTC): ~0.003 DIEM за вызов → ≤0.12 DIEM/день
+MAX_AI_CALLS_PER_DAY = int(os.environ.get("AI_MAX_CALLS_PER_DAY", "40"))
 
 SPORTS_KEYWORDS = [
     r"\bvs\.?\b", r"\bbo1\b", r"\bbo3\b", r"\bbo5\b", r"\bufc\b",
@@ -84,7 +93,7 @@ def update_ai_health(success: bool, error: str = "", latency: float = 0.0) -> Di
             send_telegram_alert(
                 "🚨 <b>АВАРИЙНЫЙ РЕЖИМ АКТИВИРОВАН!</b>\n\n"
                 "❌ <b>Потеряна связь с Venice AI!</b>\n"
-                f"Ошибка: <code>{error[:120]}</code>\n"
+                f"Ошибка: <code>{esc(error[:120])}</code>\n"
                 f"Ошибок подряд: <code>{health['consecutive_failures']}</code>\n\n"
                 "🛡 <b>Защитный протокол вступил в силу:</b>\n"
                 "• Все новые сделки заблокированы (Fail-Closed)\n"
@@ -114,7 +123,7 @@ def update_ai_health(success: bool, error: str = "", latency: float = 0.0) -> Di
                 "Все торговые модули возвращены в штатный режим."
             )
 
-    AI_HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(AI_HEALTH_FILE, health)
     return health
 
 
@@ -209,20 +218,142 @@ def classify_polymarket_risk(market: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _consume_ai_call_budget() -> bool:
+    """Учитывает платный вызов Venice в суточном лимите. False — лимит на сегодня исчерпан."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    budget: Dict[str, Any] = {}
+    if AI_BUDGET_FILE.exists():
+        try:
+            budget = json.loads(AI_BUDGET_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            budget = {}
+    if budget.get("date") != today:
+        budget = {"date": today, "calls": 0}
+    if budget["calls"] >= MAX_AI_CALLS_PER_DAY:
+        return False
+    budget["calls"] += 1
+    atomic_write_json(AI_BUDGET_FILE, budget)
+    return True
+
+
+def get_ai_budget() -> Dict[str, Any]:
+    """Сколько платных вызовов Venice сделано сегодня (UTC) и каков лимит."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    calls = 0
+    if AI_BUDGET_FILE.exists():
+        try:
+            b = json.loads(AI_BUDGET_FILE.read_text(encoding="utf-8"))
+            calls = int(b.get("calls", 0)) if b.get("date") == today else 0
+        except Exception:
+            pass
+    return {"date": today, "calls": calls, "limit": MAX_AI_CALLS_PER_DAY}
+
+
+STRATEGY_BRIEFS = {
+    "polymarket_liquidity_maker": (
+        "Стратегия: ставим двусторонние лимитные ордера (bid и ask) вокруг текущей цены ради ежедневных USDC-ревардов Polymarket. "
+        "Главный риск — резкий скачок цены (новость, событие в ближайшие дни), из-за которого наши ордера исполнят информированные трейдеры."
+    ),
+    "polymarket_smart_bonding": (
+        "Стратегия: ПОКУПАЕМ исход [{outcome}] по цене {price:.4f} и держим до резолюции. "
+        "Позиция получает $1.00 за акцию, если в итоге наступит именно исход [{outcome}], и $0.00 в противном случае. "
+        "Оцени, насколько исход [{outcome}] действительно почти гарантирован и нет ли в правилах ловушки или риска затяжной/спорной резолюции UMA."
+    ),
+    "hyperliquid_funding": (
+        "Стратегия: дельта-нейтральный сбор фандинга на Hyperliquid (перп-нога + хедж). "
+        "Главные риски — разворот знака фандинга, ликвидация перп-ноги при резком движении цены, недоступность хеджа для этого актива."
+    ),
+}
+
+
+def _build_audit_prompt(question: str, description: str, price_yes: float, strategy_type: str, outcome_label: str) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    brief = STRATEGY_BRIEFS.get(strategy_type, f"Стратегия: {strategy_type}.").format(outcome=outcome_label, price=price_yes)
+    if strategy_type == "hyperliquid_funding":
+        market_block = f"Актив: {question}\nДанные: {description[:1200]}\n"
+    else:
+        market_block = (
+            f"Вопрос рынка: {question}\n"
+            f"Рассматриваемый исход: [{outcome_label}], текущая цена ${price_yes:.4f}\n"
+            f"Правила резолюции: {description[:1200]}\n"
+        )
+    return (
+        "Ты — количественный риск-менеджер алгоритмического фонда.\n"
+        f"Текущая дата (UTC): {today}.\n"
+        f"{brief}\n"
+        f"{market_block}\n"
+        "Ответь СТРОГО в формате JSON без markdown-обертки:\n"
+        '{"decision": "APPROVE" или "SKIP", "confidence": число_0_100, '
+        '"summary": "краткое обоснование на русском (1-2 предложения)", '
+        '"watch_keywords": ["слово1", "слово2"]}'
+    )
+
+
+def _venice_single_audit(prompt: str, api_key: str, base_url: str, model: str) -> Dict[str, Any]:
+    """Один вызов Venice. Бросает исключение при сетевой ошибке или неразборчивом ответе."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 900,
+        "reasoning_effort": "low",
+        "temperature": 0.1,
+        # Без системного промпта Venice входных токенов в ~6 раз меньше (≈400 вместо ≈2500)
+        "venice_parameters": {"include_venice_system_prompt": False},
+    }
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "AI-Yield-Scanner/1.0",
+        },
+    )
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    latency = time.time() - t0
+    raw_text = (data["choices"][0]["message"].get("content") or "").strip()
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON found in: {raw_text[:80]}")
+    parsed = json.loads(match.group(0))
+
+    # Строгий разбор (Fail-Closed): всё, что не явный APPROVE с достаточной уверенностью, — SKIP
+    decision = str(parsed.get("decision", "")).strip().upper()
+    try:
+        confidence = max(0, min(100, int(parsed.get("confidence", 0))))
+    except (TypeError, ValueError):
+        confidence = 0
+    if decision != "APPROVE" or confidence < MIN_APPROVE_CONFIDENCE:
+        decision = "SKIP"
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "summary": str(parsed.get("summary", "")),
+        "watch_keywords": parsed.get("watch_keywords", []) if isinstance(parsed.get("watch_keywords"), list) else [],
+        "model_used": data.get("model", model),
+        "model_requested": model,
+        "latency_sec": round(latency, 2),
+    }
+
+
 def call_venice_market_audit(
     question: str,
     description: str,
     price_yes: float,
     strategy_type: str = "liquidity_rewards",
     outcome_label: str = "YES",
-    cache_file: str = "state/ai_audits_cache.json",
+    cache_file: str = "",
+    samples: int = 1,
+    cache_ttl_sec: float = 10800,
 ) -> Dict[str, Any]:
-    """Вызывает Venice AI (модель gemini-4-argon через локальный прокси Hermes или api.venice.ai)
-    для анализа правил рынка и принятия решения APPROVE / SKIP.
-    
-    В аварийном режиме или при сбое сети строго соблюдается принцип Fail-Closed (вход блокируется)."""
-    cache_path = Path(cache_file)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    """Вызывает Venice AI для анализа правил рынка и принятия решения APPROVE / SKIP.
+
+    samples > 1 — консенсус: APPROVE только если все выборки одобрили (сглаживает недетерминизм модели).
+    В аварийном режиме, при сбое сети или исчерпании суточного лимита строго соблюдается Fail-Closed (вход блокируется).
+    Поле "audited_at" меняется только при свежем аудите (по нему можно отличить кэш от нового вердикта)."""
+    cache_path = Path(cache_file) if cache_file else DEFAULT_AI_CACHE_FILE
     cache: Dict[str, Any] = {}
     if cache_path.exists():
         try:
@@ -232,8 +363,7 @@ def call_venice_market_audit(
 
     cache_key = f"{strategy_type}::{outcome_label}::{question[:120]}"
     now = time.time()
-    # Кэшируем аудит правил на 3 часа (бюджет 0.3 DIEM/день), чтобы оперативно учитывать новости
-    if cache_key in cache and now - cache[cache_key].get("ts", 0) < 10800:
+    if cache_key in cache and now - cache[cache_key].get("ts", 0) < cache_ttl_sec:
         return cache[cache_key]["result"]
 
     api_key = load_venice_api_key()
@@ -250,74 +380,56 @@ def call_venice_market_audit(
 
     base_url = os.environ.get("VENICE_BASE_URL", "http://127.0.0.1:8787/api/v1")
     model = os.environ.get("VENICE_MODEL", "gemini-4-argon")
+    prompt = _build_audit_prompt(question, description, price_yes, strategy_type, outcome_label)
 
-    prompt = (
-        f"Ты — количественный риск-менеджер алгоритмического фонда на Polymarket.\n"
-        f"Текущая дата: 25 октября 2026 года.\n"
-        f"Тип стратегии: {strategy_type} (если polymarket_liquidity_maker — ставим двусторонние лимитки со спредом ради ежедневных USDC-ревардов; "
-        f"если polymarket_smart_bonding — покупаем исход [{outcome_label}] по цене {price_yes:.4f} для удержания до выплаты $1.00).\n"
-        f"Вопрос рынка: {question}\n"
-        f"Рассматриваемый исход: [{outcome_label}] по цене ${price_yes:.4f}\n"
-        f"Правила резолюции: {description[:1200]}\n\n"
-        f"Ответь СТРОГО в формате JSON без markdown-обертки:\n"
-        f'{{"decision": "APPROVE" или "SKIP", "confidence": число_0_100, '
-        f'"summary": "краткое обоснование на русском (1-2 предложения: безопасно ли заходить сейчас или есть риск скачка/ловушки в правилах)", '
-        f'"watch_keywords": ["слово1", "слово2"]}}'
-    )
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 900,
-        "reasoning_effort": "low",
-        "temperature": 0.1,
-    }
-
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "AI-Yield-Scanner/1.0",
-        },
-    )
-
-    t0 = time.time()
+    votes: List[Dict[str, Any]] = []
     last_err = ""
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            latency = time.time() - t0
-            raw_text = (data["choices"][0]["message"].get("content") or "").strip()
-            match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-            if not match:
-                raise ValueError(f"No JSON found in: {raw_text[:80]}")
-            parsed = json.loads(match.group(0))
-            result = {
-                "decision": str(parsed.get("decision", "APPROVE")).upper(),
-                "confidence": int(parsed.get("confidence", 80)),
-                "summary": parsed.get("summary", ""),
-                "watch_keywords": parsed.get("watch_keywords", []),
-                "model_used": data.get("model", model),
+    for _ in range(max(1, samples)):
+        if not _consume_ai_call_budget():
+            return {
+                "decision": "SKIP",
+                "confidence": 0,
+                "summary": f"Суточный лимит вызовов Venice ({MAX_AI_CALLS_PER_DAY}) исчерпан — новые входы заблокированы до 00:00 UTC.",
+                "watch_keywords": [],
                 "emergency_mode": False,
+                "budget_exhausted": True,
+                "model_used": "none (budget)",
             }
-            cache[cache_key] = {"ts": now, "result": result}
-            cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-            update_ai_health(success=True, latency=latency)
-            return result
-    except Exception as exc:
-        latency = time.time() - t0
-        last_err = str(exc)
-        update_ai_health(success=False, error=last_err, latency=latency)
+        try:
+            vote = _venice_single_audit(prompt, api_key, base_url, model)
+        except Exception as exc:
+            last_err = str(exc)
+            update_ai_health(success=False, error=last_err, latency=0.0)
+            break
+        update_ai_health(success=True, latency=vote["latency_sec"])
+        votes.append(vote)
+        if vote["decision"] != "APPROVE":
+            break  # одного SKIP достаточно — экономим бюджет
 
-    # Принцип закрытого отказа (Fail-Closed): ни при каких обстоятельствах не входить вслепую
-    return {
-        "decision": "SKIP",
-        "confidence": 0,
-        "summary": f"Аварийный отказ (Fail-Closed): нет связи с Venice AI ({last_err[:80]}). Вход строго заблокирован.",
-        "watch_keywords": [],
-        "emergency_mode": True,
-        "model_used": "none (circuit-breaker)",
+    skip_vote = next((v for v in votes if v["decision"] != "APPROVE"), None)
+    if skip_vote is None and len(votes) < max(1, samples):
+        # Связь оборвалась до полного консенсуса. Принцип закрытого отказа (Fail-Closed): не входить вслепую
+        return {
+            "decision": "SKIP",
+            "confidence": 0,
+            "summary": f"Аварийный отказ (Fail-Closed): нет связи с Venice AI ({last_err[:80]}). Вход строго заблокирован.",
+            "watch_keywords": [],
+            "emergency_mode": True,
+            "model_used": "none (circuit-breaker)",
+        }
+
+    chosen = skip_vote or min(votes, key=lambda v: v["confidence"])
+    result = {
+        "decision": "SKIP" if skip_vote else "APPROVE",
+        "confidence": chosen["confidence"],
+        "summary": chosen["summary"],
+        "watch_keywords": chosen["watch_keywords"],
+        "model_used": chosen["model_used"],
+        "model_requested": model,
+        "samples": len(votes),
+        "audited_at": now,
+        "emergency_mode": False,
     }
+    cache[cache_key] = {"ts": now, "result": result}
+    atomic_write_json(cache_path, cache)
+    return result

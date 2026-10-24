@@ -84,7 +84,7 @@ def run_report(deposit_usd: float = 1000.0) -> None:
         )
         print(f"     • Схема: {a['strategy']}")
         print(
-            f"     • Оценка кросс-DEX спреда: ~{a['combined_cross_dex_apr_est']:.1f}% годовых "
+            f"     • Фандинг на перп-ноге: ~{a['combined_cross_dex_apr_est']:.1f}% годовых "
             f"(~${daily_hl_usd:.2f}/день на ногу Hyperliquid)\n"
         )
 

@@ -4,18 +4,18 @@ import json
 import os
 import sys
 import time
-import urllib.parse
-import urllib.request
+import traceback
 from pathlib import Path
-from typing import Dict, Any, List
 
-from telegram_notifier import load_tg_config, save_tg_config
-from ai_analyzer import get_ai_health, ping_venice_ai
+from telegram_notifier import load_tg_config, tg_api_call, tg_send_message
+from ai_analyzer import get_ai_budget, get_ai_health, ping_venice_ai
+from paper_trader import is_open, portfolio_totals, position_net_pnl
+from state_io import STATE_DIR, esc
 
 
-STATE_FILE = Path("state/portfolio_state.json")
-LOG_FILE = Path("state/paper_trader.log")
-AI_CACHE_FILE = Path("state/ai_audits_cache.json")
+STATE_FILE = STATE_DIR / "portfolio_state.json"
+LOG_FILE = STATE_DIR / "paper_trader.log"
+AI_CACHE_FILE = STATE_DIR / "ai_audits_cache.json"
 
 
 def make_main_keyboard() -> dict:
@@ -54,13 +54,9 @@ def format_portfolio_msg() -> str:
     health = get_ai_health()
     is_em = health.get("emergency_mode", False) or state.get("emergency_mode", False)
 
-    deposit = float(state["initial_deposit_usd"])
+    t = portfolio_totals(state)
+    deposit, net_pnl, weighted_apr = t["deposit"], t["net_pnl"], t["weighted_apr"]
     elapsed_hours = max(0.01, (time.time() - float(state["started_at"])) / 3600.0)
-    total_rewards = sum(p["accrued_rewards_usd"] for p in state["positions"])
-    total_losses = sum(p["adverse_loss_usd"] for p in state["positions"])
-    net_pnl = total_rewards - total_losses
-    equity = deposit + net_pnl
-    weighted_apr = sum(p["expected_apr"] * (p["allocated_usd"] / deposit) for p in state["positions"])
 
     pnl_sign = "+" if net_pnl >= 0 else ""
     pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
@@ -75,29 +71,33 @@ def format_portfolio_msg() -> str:
     msg.extend([
         f"⏱ <i>В работе: {elapsed_hours:.1f} ч (тиков: {state.get('ticks_count', 0)})</i>\n",
         f"💰 <b>Стартовый депозит:</b> ${deposit:,.2f} USDC",
-        f"💵 <b>Текущий баланс:</b> <b>${equity:,.4f} USDC</b>",
+        f"💵 <b>Текущий баланс:</b> <b>${t['equity']:,.4f} USDC</b>",
         f"{pnl_emoji} <b>Чистый PnL:</b> <b>{pnl_sign}${net_pnl:,.4f} USDC</b>",
-        f"   • Начислено ревардов: +${total_rewards:,.4f}",
-        f"   • Издержки / комиссии: -${total_losses:,.4f}",
-        f"🔥 <b>Средний APR:</b> <b>{weighted_apr:.1f}% годовых</b> (~${deposit*(weighted_apr/100)/365:.2f}/день)\n",
-        "<b>Текущие открытые слоты ($1,000 каждый):</b>",
+        f"   • Реварды и фандинг: +${t['rewards']:,.4f}",
+        f"   • Издержки / комиссии: -${t['losses']:,.4f}",
+        f"   • Переоценка бондов: ${t['unrealized']:+,.4f} | Реализовано: ${t['realized']:+,.4f}",
+        f"🔥 <b>APR открытых слотов:</b> <b>{weighted_apr:.1f}% годовых</b> (~${deposit*(weighted_apr/100)/365:.2f}/день)",
+        f"💤 <b>Свободный капитал:</b> ${t['idle_usd']:,.0f}\n",
+        f"<b>Слоты ($1,000 каждый), открыто: {t['open_count']}:</b>",
     ])
 
     for i, p in enumerate(state["positions"], 1):
-        slot_pnl = p["accrued_rewards_usd"] - p["adverse_loss_usd"]
+        slot_pnl = position_net_pnl(p)
         sp_sign = "+" if slot_pnl >= 0 else ""
         icon = "🏦" if p["type"] == "poly_mm" else ("🎯" if p["type"] == "poly_bond" else "⚡️")
         q_short = p['title'][:42] + ("..." if len(p['title']) > 42 else "")
         msg.append(
-            f"{i}. {icon} <b>{q_short}</b>\n"
+            f"{i}. {icon} <b>{esc(q_short)}</b>\n"
             f"   APR: <code>{p['expected_apr']:.1f}%</code> | PnL: <b>{sp_sign}${slot_pnl:.4f}</b>"
         )
-        if p.get("mm_defensive_paused", False):
+        if not is_open(p):
+            msg.append(f"   ⏹ <i>Закрыта ({esc(p.get('status'))}): {esc(p.get('close_reason', ''))}</i>")
+        elif p.get("mm_defensive_paused", False):
             msg.append("   ⚠️ <i>Лимитки сняты (Защитная пауза: нет связи с ИИ)</i>")
         elif p["type"] == "poly_mm":
             msg.append(f"   Коридор: <code>{p['bid_limit']:.4f} .. {p['ask_limit']:.4f}</code> (сейчас: {p['current_mid']:.4f})")
-        elif p.get("status") == "STOPPED_OUT":
-            msg.append("   🚨 <i>Позиция закрыта по Stop-Loss</i>")
+        elif p["type"] == "poly_bond":
+            msg.append(f"   Вход: <code>{p['entry_price']:.4f}</code> → сейчас <code>{p['current_price']:.4f}</code>")
 
     return "\n".join(msg)
 
@@ -128,13 +128,14 @@ def format_emergency_msg() -> str:
         f"⏱ <b>Задержка последнего ответа:</b> <code>{latency:.2f} сек</code>",
         f"🕒 <b>Последний успешный опрос:</b> <code>{last_succ} UTC</code>",
         f"⚠️ <b>Ошибок подряд:</b> <code>{fails}</code>",
-        f"📋 <b>Последнее системное событие:</b> <code>{last_err[:90]}</code>\n",
+        f"📋 <b>Последнее системное событие:</b> <code>{esc(last_err[:90])}</code>\n",
         "<b>Как система защищает капитал при сбое связи:</b>",
         "1. 🔒 <b>Fail-Closed:</b> Если ИИ недоступен, бот <b>категорически блокирует</b> вход в любые новые позиции. Никаких сделок «вслепую».",
         "2. 🛑 <b>MM Defensive Pause:</b> Лимитные ордера в стакане Polymarket немедленно снимаются, исключая риск токсичного выкупа информированными трейдерами.",
-        "3. 🎯 <b>Bonding Stop-Loss:</b> Если в период отсутствия ИИ котировка купленного бонда проседает ниже 95.0¢, срабатывает мгновенная ликвидация для спасения тела депозита.",
-        "4. ⚡️ <b>Funding Auto-Halt:</b> Дельта-нейтральный фандинг Hyperliquid отслеживается независимым L1 API и закрывается при смене знака ставки.",
-        "5. 📲 <b>Push-Оповещения:</b> Мгновенный алерт в Telegram при сбое и автоматическое возобновление при поднятии связи.",
+        "3. 🎯 <b>Bonding Stop-Loss:</b> Если котировка купленного бонда проседает ниже 95.0¢, позиция продается (действует всегда, не только при сбое ИИ).",
+        "4. ⚡️ <b>Funding Auto-Halt:</b> Фандинг Hyperliquid отслеживается через L1 API; позиция закрывается, если знак ставки 2 тика подряд против нас.",
+        "5. 🧠 <b>Повторный аудит ИИ:</b> Открытые позиции Polymarket перепроверяются каждые 6 ч; два SKIP подряд — позиция закрывается.",
+        "6. 📲 <b>Push-Оповещения:</b> Мгновенный алерт в Telegram при сбое и автоматическое возобновление при поднятии связи.",
     ]
     return "\n".join(msg)
 
@@ -161,9 +162,9 @@ def format_ai_verdicts_msg() -> str:
         summary = res.get("summary", "")
 
         msg.append(
-            f"{dec_icon} <b>{dec} ({conf}%)</b> | <i>{strat}</i>\n"
-            f"<b>{q}...</b>\n"
-            f"<i>\"{summary}\"</i>\n"
+            f"{dec_icon} <b>{esc(dec)} ({conf}%)</b> | <i>{esc(strat)}</i>\n"
+            f"<b>{esc(q)}...</b>\n"
+            f"<i>\"{esc(summary[:220])}\"</i>\n"
         )
     return "\n".join(msg)
 
@@ -173,22 +174,39 @@ def format_logs_msg() -> str:
         return "📜 <b>Лог событий пока пуст.</b>"
 
     lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
-    recent = lines[-12:]
-    return "📜 <b>ПОСЛЕДНИЕ 12 СОБЫТИЙ:</b>\n\n<code>" + "\n".join(recent) + "</code>"
+    # Берем строки с конца, пока сообщение укладывается в лимит Telegram (4096 символов)
+    recent, size = [], 0
+    for line in reversed(lines[-12:]):
+        line = esc(line if len(line) <= 300 else line[:297] + "...")
+        if size + len(line) + 1 > 3700:
+            break
+        recent.insert(0, line)
+        size += len(line) + 1
+    return f"📜 <b>ПОСЛЕДНИЕ {len(recent)} СОБЫТИЙ:</b>\n\n<code>" + "\n".join(recent) + "</code>"
 
 
 def format_settings_msg() -> str:
     cfg = load_tg_config()
     alerts = "Включены ✅" if cfg.get("alerts_enabled", True) else "Выключены ❌"
     model = os.environ.get("VENICE_MODEL", "gemini-4-argon")
+    budget = get_ai_budget()
+    deposit = 5000.0
+    if STATE_FILE.exists():
+        try:
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            deposit = float(st.get("initial_deposit_usd", 5000.0))
+        except Exception:
+            pass
+    slot_sz = deposit / 5.0
     return (
         "⚙️ <b>НАСТРОЙКИ СИСТЕМЫ</b>\n\n"
-        f"🤖 <b>Модель Venice AI:</b> <code>{model}</code> (лимит 0.3 DIEM/день)\n"
+        f"🤖 <b>Модель Venice AI:</b> <code>{esc(model)}</code> (консенсус 2/2 при входе)\n"
+        f"💳 <b>Вызовов ИИ сегодня:</b> {budget['calls']} из {budget['limit']} (~0.003 DIEM за вызов)\n"
         f"🔔 <b>Push-алерты:</b> {alerts}\n"
-        f"⏱ <b>Интервал тиков:</b> 15 минут (900 сек)\n"
-        f"💼 <b>Размер депозита:</b> $5,000 USDC (5 слотов по $1,000)\n"
-        f"🛡 <b>ИИ Kill-Switch:</b> Активен (порог движения цены: >1.0¢)\n"
-        f"🚨 <b>Аварийный режим (Fail-Closed):</b> Активен (автоснятие ордеров при 2 сбоях связи)\n\n"
+        f"📐 <b>Формула ревардов MM:</b> Квадратичная по живому стакану CLOB\n"
+        f"💼 <b>Размер депозита:</b> ${deposit:,.0f} USDC (5 слотов по ${slot_sz:,.0f})\n"
+        f"🛡 <b>Kill-Switch:</b> Активен (порог движения цены: ≥1.0¢, повторный аудит ИИ каждые 6ч)\n"
+        f"🚨 <b>Аварийный режим (Fail-Closed):</b> Активен (пульс ИИ каждый тик, автоснятие ордеров)\n\n"
         "📖 Подробная справка по всем формулам доступна по кнопке <b>«Инструкция»</b> ниже."
     )
 
@@ -212,30 +230,13 @@ class SimpleTelegramBot:
     def __init__(self, token: str, admin_id: str):
         self.token = token
         self.admin_id = str(admin_id)
-        self.base_url = f"https://api.telegram.org/bot{self.token}"
         self.last_update_id = 0
 
     def api_call(self, method: str, payload: dict) -> dict:
-        url = f"{self.base_url}/{method}"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=35) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return tg_api_call(self.token, method, payload)
 
     def send_menu(self, chat_id: str, text: str):
-        self.api_call("sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            "reply_markup": make_main_keyboard(),
-        })
+        tg_send_message(self.token, chat_id, text, reply_markup=make_main_keyboard())
 
     def answer_callback(self, cb_id: str, text: str = ""):
         self.api_call("answerCallbackQuery", {
@@ -263,6 +264,7 @@ class SimpleTelegramBot:
                     "timeout": 25,
                 })
                 if not res.get("ok"):
+                    print(f"[bot] getUpdates: {res.get('error') or res.get('description')}", flush=True)
                     time.sleep(2)
                     continue
 
@@ -287,7 +289,7 @@ class SimpleTelegramBot:
                             self.send_menu(chat_id, format_emergency_msg())
                         elif text == "/ping":
                             p = ping_venice_ai()
-                            res_str = f"✅ Venice AI Ping: {p.get('latency_sec')}с" if p.get("ok") else f"❌ Сбой: {p.get('error')}"
+                            res_str = f"✅ Venice AI Ping: {p.get('latency_sec')}с" if p.get("ok") else f"❌ Сбой: {esc(p.get('error'))}"
                             self.send_menu(chat_id, f"⚡️ <b>Результат проверки связи:</b>\n{res_str}\n\n" + format_emergency_msg())
                         elif text == "/logs":
                             self.send_menu(chat_id, format_logs_msg())
@@ -329,7 +331,8 @@ class SimpleTelegramBot:
                             self.answer_callback(cb_id, text=pop_text)
                             self.send_menu(chat_id, format_emergency_msg())
 
-            except Exception as exc:
+            except Exception:
+                print(f"[bot] ошибка обработки обновлений:\n{traceback.format_exc()}", flush=True)
                 time.sleep(3)
 
 
