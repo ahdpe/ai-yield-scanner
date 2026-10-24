@@ -1,0 +1,8 @@
+# Private state, logs and credentials (PROTECTED)
+state/
+*.log
+.env*
+*.env
+__pycache__/
+*.pyc
+.DS_Store
