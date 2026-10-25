@@ -15,6 +15,10 @@ GAMMA_MARKETS_URL = (
 )
 GAMMA_MARKET_BY_SLUG_URL = "https://gamma-api.polymarket.com/markets?slug={slug}"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book?token_id={token_id}"
+DATA_TRADES_URL = "https://data-api.polymarket.com/trades?market={condition_id}&limit={limit}"
+
+# MM только на рынках, до истечения которых не меньше недели: ближе к дате резолюции растет риск новостного обвала
+MM_MIN_DAYS_TO_END = 7.0
 
 
 def fetch_polymarket_markets() -> List[Dict[str, Any]]:
@@ -48,6 +52,36 @@ def fetch_clob_book(token_id: str) -> Optional[Dict[str, Any]]:
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def days_until(end_str: str) -> Optional[float]:
+    """Сколько дней осталось до даты (ISO, с 'Z' или без зоны — считается UTC). None — дата не задана или битая."""
+    if not end_str:
+        return None
+    try:
+        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    return (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+
+
+def fetch_recent_trades(condition_id: str, since_ts: float, limit: int = 500) -> List[Dict[str, Any]]:
+    """Сделки рынка (обе стороны: YES и NO) строго после since_ts из публичной ленты Polymarket Data API."""
+    req = urllib.request.Request(
+        DATA_TRADES_URL.format(condition_id=urllib.parse.quote(condition_id, safe=""), limit=limit),
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        trades = json.loads(resp.read().decode("utf-8"))
+    return [t for t in trades if float(t.get("timestamp") or 0) > since_ts]
+
+
+def trade_yes_price(trade: Dict[str, Any]) -> float:
+    """Цена сделки в терминах первого исхода (YES): покупка NO по p равна продаже YES по 1 - p."""
+    price = float(trade["price"])
+    return price if int(trade.get("outcomeIndex", 0)) == 0 else 1.0 - price
 
 
 def parse_clob_token_ids(m: Dict[str, Any]) -> List[str]:
@@ -165,8 +199,10 @@ def scan_liquidity_rewards(
     markets: List[Dict[str, Any]],
     deposit_usd: float = 1000.0,
     min_safety_score: int = 65,
+    min_days_to_end: float = MM_MIN_DAYS_TO_END,
 ) -> List[Dict[str, Any]]:
-    """Находит лучшие безопасные рынки с ежедневными выплатами в USDC, проверяя реальный стакан CLOB."""
+    """Находит лучшие безопасные рынки с ежедневными выплатами в USDC, проверяя реальный стакан CLOB.
+    Рынки, которые истекают раньше чем через min_days_to_end дней (или без даты), отбрасываются."""
     pre_candidates: List[Tuple[float, Dict[str, Any], Dict[str, Any], str]] = []
 
     for m in markets:
@@ -181,6 +217,10 @@ def scan_liquidity_rewards(
 
         max_spread_cents = float(m.get("rewardsMaxSpread") or 0.0)
         if max_spread_cents <= 1.5:
+            continue
+
+        days_left = days_until(m.get("endDate") or "")
+        if days_left is None or days_left < min_days_to_end:
             continue
 
         risk_info = classify_polymarket_risk(m)
@@ -244,6 +284,8 @@ def scan_liquidity_rewards(
             "holding_rewards": bool(m.get("holdingRewardsEnabled")),
             "risk": risk_info,
             "description": m.get("description", ""),
+            "condition_id": m.get("conditionId", ""),
+            "end_date": m.get("endDate") or "",
         })
 
     results.sort(key=lambda x: x["conservative_apr"] * (x["risk"]["score"] / 100.0), reverse=True)
@@ -308,7 +350,7 @@ def scan_smart_bonding(
             "annualized_apr": annualized_apr,
             "profit_usd": profit_usd,
             "book_liquidity_usd": book_liq,
-            "end_date": end_str[:10],
+            "end_date": end_str,
             "risk": risk_info,
             "description": (m.get("description") or "")[:300],
         })

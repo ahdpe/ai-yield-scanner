@@ -94,6 +94,9 @@ def format_portfolio_msg() -> str:
             msg.append(f"   ⏹ <i>Закрыта ({esc(p.get('status'))}): {esc(p.get('close_reason', ''))}</i>")
         elif p.get("mm_defensive_paused", False):
             msg.append("   ⚠️ <i>Лимитки сняты (Защитная пауза: нет связи с ИИ)</i>")
+        elif float(p.get("mm_paused_until") or 0.0) > time.time():
+            until = time.strftime("%H:%M", time.gmtime(float(p["mm_paused_until"])))
+            msg.append(f"   ⏸ <i>Лимитки сняты после исполнения, пауза до {until} UTC</i>")
         elif p["type"] == "poly_mm":
             msg.append(f"   Коридор: <code>{p['bid_limit']:.4f} .. {p['ask_limit']:.4f}</code> (сейчас: {p['current_mid']:.4f})")
         elif p["type"] == "poly_bond":
@@ -204,9 +207,11 @@ def format_settings_msg() -> str:
         f"💳 <b>Вызовов ИИ сегодня:</b> {budget['calls']} из {budget['limit']} (~0.003 DIEM за вызов; "
         f"{budget['reserve']} зарезервировано под повторные аудиты)\n"
         f"🔔 <b>Push-алерты:</b> {alerts}\n"
-        f"📐 <b>Формула ревардов MM:</b> Квадратичная по живому стакану CLOB\n"
+        f"📐 <b>Формула ревардов MM:</b> Квадратичная по живому стакану CLOB (потолок 365% годовых)\n"
+        f"🔎 <b>Исполнение лимиток:</b> по ленте сделок Polymarket, проверка раз в 60 с; пауза 3 ч после исполнения\n"
+        f"📅 <b>Фильтр MM:</b> только рынки, до истечения которых ≥ 7 дней (снятие при < 2 дн.)\n"
         f"💼 <b>Размер депозита:</b> ${deposit:,.0f} USDC (5 слотов по ${slot_sz:,.0f})\n"
-        f"🛡 <b>Kill-Switch:</b> Активен (порог движения цены: ≥1.0¢, повторный аудит ИИ каждые 6ч)\n"
+        f"🛡 <b>Kill-Switch:</b> Активен (сдвиг ≥1.0¢ от цены выставления лимиток, повторный аудит ИИ каждые 6ч)\n"
         f"🚨 <b>Аварийный режим (Fail-Closed):</b> Активен (пульс ИИ каждый тик, автоснятие ордеров)\n\n"
         "📖 Подробная справка по всем формулам доступна по кнопке <b>«Инструкция»</b> ниже."
     )

@@ -19,13 +19,16 @@ from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
 from polymarket_scanner import (
     compute_quadratic_mm_metrics,
+    days_until,
     fetch_clob_book,
     fetch_polymarket_markets,
     fetch_market_by_slug,
+    fetch_recent_trades,
     parse_clob_token_ids,
     parse_outcome_prices,
     scan_liquidity_rewards,
     scan_smart_bonding,
+    trade_yes_price,
 )
 from hyperliquid_scanner import fetch_hl_spot_hedge_map, scan_funding_anomalies, hl_request
 
@@ -45,6 +48,14 @@ MAX_ACCRUAL_GAP_SEC = 3600        # дольше часа без наблюде�
 REOPEN_COOLDOWN_SEC = 12 * 3600   # не переоткрываем закрытый рынок в течение 12 часов
 REFILL_FRESH_AUDITS_PER_STRATEGY = 1  # за тик — не больше 1 нового кандидата на стратегию (≤3 платных проверки)
 MM_SPREAD_FRACTION = 0.65         # отступ наших лимиток от mid в долях rewardsMaxSpread
+MM_POLL_SEC = 60                  # между полными тиками стакан и лента сделок MM-слотов проверяются раз в минуту
+MM_FILL_PAUSE_SEC = 3 * 3600      # после исполнения лимитки котирование рынка на паузе 3 часа
+MM_FILLS_TO_CLOSE = 2             # второе исполнение за сутки — слот закрывается, капитал уходит в другой рынок
+MM_FILL_WINDOW_SEC = 24 * 3600
+MM_MIN_DAYS_TO_END_HOLD = 2.0     # открытый MM-слот снимается, когда до истечения рынка меньше 2 дней
+MM_MAX_ACCRUAL_APR = 365.0        # потолок APR ревардов при начислении (1% в день)
+MM_APR_MAX_RISE_PER_HOUR = 2.0    # расчетный APR растет не быстрее чем вдвое за час (пустой стакан после обвала — не доход)
+LOG_THROTTLE_SEC = 900            # повторяющиеся служебные сообщения MM-слота — не чаще раза в 15 минут
 
 
 def log_event(msg: str) -> None:
@@ -160,6 +171,7 @@ def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Tuple[O
         strategy_type="polymarket_liquidity_maker",
         samples=ENTRY_AI_SAMPLES,
         budget_reserve=REAUDIT_RESERVE_CALLS,
+        end_date=item.get("end_date", ""),
     )
     if not _is_cached_verdict(audit, now):  # кэшированные SKIP не дублируем в логе каждый тик
         log_event(
@@ -178,6 +190,8 @@ def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Tuple[O
         "title": item["question"],
         "slug": item["slug"],
         "token_id": item.get("token_id", ""),
+        "condition_id": item.get("condition_id", ""),
+        "end_date": item.get("end_date", ""),
         "daily_reward_pool_usd": item.get("daily_reward_pool_usd", 0.0),
         "min_order_size": item.get("min_order_size", 0.0),
         "allocated_usd": slot_size,
@@ -185,11 +199,14 @@ def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Tuple[O
         "current_mid": mid,
         "bid_limit": item["bid_limit"],
         "ask_limit": item["ask_limit"],
+        "quote_anchor_mid": mid,
+        "last_mm_check_at": now,
+        "reward_apr_ref": min(float(item["conservative_apr"]), MM_MAX_ACCRUAL_APR),
         "book_spread": item.get("book_spread", 0.01),
         "book_quadratic_score": item.get("book_quadratic_score", 0.0),
         "max_spread_cents": item["max_spread_cents"],
         # Используем честный квадратичный APR при отступе 0.65 * max_spread против реального стакана CLOB
-        "expected_apr": round(float(item["conservative_apr"]), 2),
+        "expected_apr": round(min(float(item["conservative_apr"]), MM_MAX_ACCRUAL_APR), 2),
         "accrued_rewards_usd": 0.0,
         "adverse_loss_usd": 0.0,
         "rebalances_count": 0,
@@ -207,6 +224,7 @@ def _open_bond_slot(b: Dict[str, Any], slot_size: float, now: float) -> Tuple[Op
         outcome_label=b["lead_outcome"],
         samples=ENTRY_AI_SAMPLES,
         budget_reserve=REAUDIT_RESERVE_CALLS,
+        end_date=b.get("end_date", ""),
     )
     if not _is_cached_verdict(audit, now):  # кэшированные SKIP не дублируем в логе каждый тик
         log_event(
@@ -314,7 +332,7 @@ def init_portfolio(deposit_usd: float = 5000.0) -> Dict[str, Any]:
             break
 
     state = {
-        "schema": 3,
+        "schema": 4,
         "started_at": now,
         "started_at_iso": datetime.now(timezone.utc).isoformat(),
         "last_tick_at": now,
@@ -523,8 +541,197 @@ def migrate_state(
                         )
         state["schema"] = 3
 
+    if int(state.get("schema", 3)) < 4:
+        # Схема 4: исполнение лимиток по ленте сделок, пауза после исполнения, демпфированное начисление ревардов
+        for pos in state["positions"]:
+            if pos["type"] != "poly_mm" or not is_open(pos):
+                continue
+            m = by_slug.get(pos.get("slug")) or by_q.get(pos.get("title"))
+            if m is None and pos.get("slug"):
+                try:
+                    m = fetch_market_by_slug(pos["slug"])
+                except Exception:
+                    m = None
+            if m:
+                pos["condition_id"] = m.get("conditionId", "")
+                pos["end_date"] = m.get("endDate") or ""
+            pos.setdefault("quote_anchor_mid", pos.get("current_mid"))
+            pos.setdefault("last_mm_check_at", state.get("last_tick_at"))
+            pos["reward_apr_ref"] = min(float(pos.get("expected_apr", 0.0)), MM_MAX_ACCRUAL_APR)
+            pos["expected_apr"] = round(pos["reward_apr_ref"], 2)
+        state["schema"] = 4
 
-def maybe_reaudit(pos: Dict[str, Any], strategy_type: str, price: float, description: str, outcome_label: str = "YES") -> bool:
+
+def _log_throttled(pos: Dict[str, Any], key: str, msg: str, now: float) -> None:
+    stamps = pos.setdefault("log_throttle", {})
+    if now - float(stamps.get(key, 0.0)) >= LOG_THROTTLE_SEC:
+        stamps[key] = now
+        log_event(msg)
+
+
+def _place_quotes(pos: Dict[str, Any], mid: float) -> None:
+    """Выставляет двусторонние лимитки вокруг mid и запоминает цену выставления для Kill-Switch."""
+    half_c = (float(pos["max_spread_cents"]) / 100.0) * MM_SPREAD_FRACTION
+    pos["bid_limit"] = max(0.01, round(mid - half_c, 4))
+    pos["ask_limit"] = min(0.99, round(mid + half_c, 4))
+    pos["quote_anchor_mid"] = mid
+
+
+def _accrue_mm_rewards(pos: Dict[str, Any], cur_apr: float, elapsed_sec: float) -> None:
+    """Начисляет реварды за окно, в котором лимитки простояли без исполнения.
+    Берется меньший из APR на начало и конец окна; рост APR ограничен (вдвое за час) и есть потолок 365%."""
+    prev = float(pos.get("reward_apr_ref", min(float(pos.get("expected_apr", 0.0)), MM_MAX_ACCRUAL_APR)))
+    damped = min(cur_apr, max(prev, 0.01) * MM_APR_MAX_RISE_PER_HOUR ** (elapsed_sec / 3600.0), MM_MAX_ACCRUAL_APR)
+    apr = min(prev, damped)
+    pos["reward_apr_ref"] = round(damped, 4)
+    pos["expected_apr"] = round(damped, 2)
+    gain = float(pos["allocated_usd"]) * (apr / 100.0) * elapsed_sec / (365.0 * 86400.0)
+    pos["accrued_rewards_usd"] = round(float(pos["accrued_rewards_usd"]) + gain, 6)
+
+
+def _handle_mm_fill(pos: Dict[str, Any], bid_hit: bool, ask_hit: bool, mid: float, now: float) -> None:
+    """Лимитку исполнили: инвентарь сразу закрывается по рынку с проскальзыванием, котирование ставится на паузу."""
+    bid, ask = float(pos["bid_limit"]), float(pos["ask_limit"])
+    shares = float(pos["allocated_usd"]) / max(0.20, bid + (1.0 - ask))
+    slip = max(float(pos.get("book_spread", 0.01)) / 2.0, 0.008)
+    if bid_hit and ask_hit:
+        pnl, what = shares * (ask - bid), f"обе лимитки ({bid:.4f} и {ask:.4f})"
+    elif bid_hit:
+        pnl, what = shares * ((mid - slip) - bid), f"покупка по {bid:.4f}"
+    else:
+        pnl, what = shares * (ask - (mid + slip)), f"продажа по {ask:.4f}"
+    pnl = round(pnl, 4)
+    if pnl < 0:
+        pos["adverse_loss_usd"] = round(float(pos["adverse_loss_usd"]) - pnl, 4)
+    else:
+        pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd", 0.0)) + pnl, 4)
+    fills = [t for t in pos.get("fill_times", []) if now - float(t) < MM_FILL_WINDOW_SEC] + [now]
+    pos["fill_times"] = fills
+    pos["rebalances_count"] = int(pos.get("rebalances_count", 0)) + 1
+    pos["current_mid"] = mid
+    log_event(
+        f"⚠️ ИСПОЛНЕНИЕ ЛИМИТКИ [{pos['title'][:40]}]: по ленте сделок — {what}, рынок {mid:.4f}; "
+        f"инвентарь {shares:,.0f} акций закрыт, результат ${pnl:+.2f}."
+    )
+    if len(fills) >= MM_FILLS_TO_CLOSE:
+        close_position(pos, "CLOSED_RULE", f"{len(fills)} исполнения лимиток за сутки — рынок слишком нервный для MM")
+        return
+    pos["mm_paused_until"] = now + MM_FILL_PAUSE_SEC
+    resume_at = datetime.fromtimestamp(pos["mm_paused_until"], timezone.utc).strftime("%H:%M")
+    send_telegram_alert(
+        f"⚠️ <b>Исполнена лимитка Polymarket</b>\n"
+        f"Рынок: <i>{esc(pos['title'])}</i>\n"
+        f"Сделка: {esc(what)}, рынок сейчас <code>{mid:.4f}</code>\n"
+        f"Результат закрытия инвентаря: <b>${pnl:+.2f} USDC</b>\n"
+        f"Котирование на паузе до <b>{resume_at} UTC</b>"
+    )
+
+
+def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
+    """Проверка MM-слота: исполнение лимиток по ленте сделок, Kill-Switch от цены выставления, начисление ревардов."""
+    window_start = float(pos.get("last_mm_check_at") or now)
+    elapsed_sec = min(max(0.0, now - window_start), MAX_ACCRUAL_GAP_SEC)
+    pos["last_mm_check_at"] = now
+    title = pos["title"][:40]
+
+    paused_until = float(pos.get("mm_paused_until") or 0.0)
+    if paused_until > now:
+        return  # лимитки сняты после исполнения — ни риска, ни ревардов
+
+    qm = None
+    try:
+        book = fetch_clob_book(pos["token_id"]) if pos.get("token_id") else None
+        if book:
+            qm = compute_quadratic_mm_metrics(
+                book=book,
+                daily_reward_usd=float(pos.get("daily_reward_pool_usd", 0.0)),
+                max_spread_cents=float(pos["max_spread_cents"]),
+                min_size=float(pos.get("min_order_size", 0.0)),
+                deposit_usd=float(pos["allocated_usd"]),
+                spread_fraction=MM_SPREAD_FRACTION,
+            )
+    except Exception as exc:
+        _log_throttled(pos, "book", f"⚠️ CLOB стакан [{title}] недоступен: {exc}", now)
+
+    trades: Optional[List[Dict[str, Any]]] = None
+    if pos.get("condition_id"):
+        try:
+            trades = fetch_recent_trades(pos["condition_id"], window_start)
+        except Exception as exc:
+            _log_throttled(pos, "trades", f"⚠️ Лента сделок [{title}] недоступна: {exc} — исполнение проверяется по mid.", now)
+
+    if qm:
+        mid = qm["mid"]
+        pos["book_spread"] = qm["book_spread"]
+        pos["book_quadratic_score"] = qm["book_q"]
+    elif trades:
+        mid = trade_yes_price(trades[0])  # лента отсортирована от новых к старым
+    else:
+        mid = float(pos["current_mid"])
+
+    if paused_until:
+        # Пауза закончилась: возвращаем лимитки, только если стакан снова нормальный; за окно паузы ничего не начисляем
+        if not qm:
+            _log_throttled(pos, "resume", f"⏸ [{title}] пауза продлена: стакан пуст или спред шире зоны ревардов.", now)
+            return
+        pos["mm_paused_until"] = 0.0
+        _place_quotes(pos, mid)
+        pos["current_mid"] = mid
+        log_event(f"▶️ [{title}] лимитки возвращены после паузы: {pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f}.")
+        return
+
+    # Исполнение: любая сделка за окно по цене не хуже нашей лимитки (продажа YES ≤ bid или покупка YES ≥ ask)
+    bid, ask = float(pos["bid_limit"]), float(pos["ask_limit"])
+    if trades is not None:
+        prices = [trade_yes_price(t) for t in trades]
+        bid_hit, ask_hit = any(px <= bid for px in prices), any(px >= ask for px in prices)
+    else:
+        bid_hit, ask_hit = mid <= bid, mid >= ask
+    if bid_hit or ask_hit:
+        _handle_mm_fill(pos, bid_hit, ask_hit, mid, now)
+        return  # за окно с исполнением реварды не начисляются
+
+    if qm:
+        _accrue_mm_rewards(pos, qm["quadratic_apr"], elapsed_sec)
+    else:
+        _log_throttled(pos, "noqm", f"⚠️ [{title}] стакан пуст или спред шире зоны ревардов — реварды не начисляются.", now)
+
+    # Kill-Switch: переставляем лимитки, если цена ушла на ≥1¢ от цены, при которой они выставлены
+    anchor = float(pos.get("quote_anchor_mid") or pos["current_mid"])
+    if abs(mid - anchor) >= KILL_SWITCH_MOVE:
+        _place_quotes(pos, mid)
+        pos["rebalances_count"] = int(pos.get("rebalances_count", 0)) + 1
+        pos["ks_pending"] = int(pos.get("ks_pending", 0)) + 1
+        if now - float(pos.get("ks_logged_at", 0.0)) >= LOG_THROTTLE_SEC:
+            log_event(
+                f"🛡️ KILL-SWITCH [{title}]: лимитки переставлены {pos['ks_pending']} раз(а), "
+                f"цена {anchor:.4f} -> {mid:.4f}, коридор {pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f}."
+            )
+            pos["ks_pending"] = 0
+            pos["ks_logged_at"] = now
+    pos["current_mid"] = mid
+
+
+def fast_mm_tick() -> None:
+    """Минутная проверка открытых MM-слотов между полными тиками: только стакан и лента сделок, без Gamma API и без ИИ."""
+    if not STATE_FILE.exists() or get_ai_health().get("emergency_mode", False):
+        return
+    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    active = [
+        p for p in state["positions"]
+        if is_open(p) and p["type"] == "poly_mm" and not p.get("mm_defensive_paused", False)
+    ]
+    if not active:
+        return
+    now = time.time()
+    for pos in active:
+        mm_quote_step(pos, now)
+    save_state(state)
+
+
+def maybe_reaudit(
+    pos: Dict[str, Any], strategy_type: str, price: float, description: str, outcome_label: str = "YES", end_date: str = ""
+) -> bool:
     """Повторный аудит ИИ открытой позиции Polymarket. True — позицию нужно закрыть (два свежих SKIP подряд)."""
     streak = int(pos.get("ai_skip_streak", 0))
     audit = call_venice_market_audit(
@@ -534,6 +741,7 @@ def maybe_reaudit(pos: Dict[str, Any], strategy_type: str, price: float, descrip
         strategy_type=strategy_type,
         outcome_label=outcome_label,
         cache_ttl_sec=REAUDIT_INTERVAL_SEC if streak == 0 else REAUDIT_RECHECK_SEC,
+        end_date=end_date,
     )
     audited_at = audit.get("audited_at")
     if not audited_at or audited_at == pos.get("last_audit_ts"):
@@ -617,114 +825,50 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
 
         if pos["type"] == "poly_mm":
             m = find_market(pos)
-            if m is None:
-                continue
-            if market_trading_finished(m):
-                close_position(pos, "RESOLVED", "рынок закрыт или истек — лимитки сняты")
-                continue
-
-            # Загружаем живой стакан CLOB для точной проверки цены, спреда и квадратичного APR
-            if not pos.get("token_id"):
-                tids = parse_clob_token_ids(m)
-                if tids:
-                    pos["token_id"] = tids[0]
-            rewards = m.get("clobRewards") or []
-            daily_pool = sum(float(r.get("rewardsDailyRate") or 0.0) for r in rewards)
-            pos["daily_reward_pool_usd"] = daily_pool
-            pos["min_order_size"] = float(m.get("rewardsMinSize") or 0.0)
-            if daily_pool <= 0.0:
-                close_position(pos, "CLOSED_RULE", "пул дневных ревардов clobRewards обнулился")
-                continue
-
-            qm = None
-            if pos.get("token_id"):
-                try:
-                    book = fetch_clob_book(pos["token_id"])
-                    if book:
-                        qm = compute_quadratic_mm_metrics(
-                            book=book,
-                            daily_reward_usd=daily_pool,
-                            max_spread_cents=float(pos["max_spread_cents"]),
-                            min_size=pos["min_order_size"],
-                            deposit_usd=alloc,
-                            spread_fraction=MM_SPREAD_FRACTION,
-                        )
-                except Exception as exc:
-                    log_event(f"⚠️ CLOB стакан [{pos['title'][:35]}] недоступен: {exc}")
-
-            new_mid = qm["mid"] if qm else outcome_price(m, "Yes", pos["current_mid"])
-            hr_move = abs(float(m.get("oneHourPriceChange") or 0.0))
-            if qm:
-                pos["expected_apr"] = qm["quadratic_apr"]
-                pos["book_spread"] = qm["book_spread"]
-                pos["book_quadratic_score"] = qm["book_q"]
+            if m is not None:
+                if market_trading_finished(m):
+                    close_position(pos, "RESOLVED", "рынок закрыт или истек — лимитки сняты")
+                    continue
+                pos["end_date"] = m.get("endDate") or pos.get("end_date", "")
+                days_left = days_until(pos["end_date"])
+                if days_left is not None and days_left < MM_MIN_DAYS_TO_END_HOLD:
+                    close_position(
+                        pos, "CLOSED_RULE",
+                        f"до истечения рынка {max(days_left, 0.0):.1f} дн. (< {MM_MIN_DAYS_TO_END_HOLD:.0f}) — MM снят до развязки",
+                    )
+                    continue
+                if not pos.get("token_id"):
+                    tids = parse_clob_token_ids(m)
+                    if tids:
+                        pos["token_id"] = tids[0]
+                pos["condition_id"] = m.get("conditionId") or pos.get("condition_id", "")
+                rewards = m.get("clobRewards") or []
+                daily_pool = sum(float(r.get("rewardsDailyRate") or 0.0) for r in rewards)
+                pos["daily_reward_pool_usd"] = daily_pool
+                pos["min_order_size"] = float(m.get("rewardsMinSize") or 0.0)
+                if daily_pool <= 0.0:
+                    close_position(pos, "CLOSED_RULE", "пул дневных ревардов clobRewards обнулился")
+                    continue
 
             if is_emergency:
+                # В аварийном режиме (нет связи с Venice AI) лимитки сняты: окно паузы не начисляется
                 if not pos.get("mm_defensive_paused", False):
                     pos["mm_defensive_paused"] = True
-                    log_event(
-                        f"🛡️ [АВАРИЙНЫЙ РЕЖИМ] {pos['title'][:35]}: лимитки сняты для защиты капитала."
-                    )
-                pos["current_mid"] = new_mid
+                    log_event(f"🛡️ [АВАРИЙНЫЙ РЕЖИМ] {pos['title'][:35]}: лимитки сняты для защиты капитала.")
+                pos["last_mm_check_at"] = now
                 continue
-
             if pos.get("mm_defensive_paused", False):
                 pos["mm_defensive_paused"] = False
-                half_c = (pos["max_spread_cents"] / 100.0) * MM_SPREAD_FRACTION
-                pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
-                pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
-                log_event(
-                    f"✅ [ШТАТНЫЙ РЕЖИМ] {pos['title'][:35]}: лимитки возвращены в стакан ({pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f})."
-                )
+                pos["mm_paused_until"] = max(float(pos.get("mm_paused_until") or 0.0), now - 1.0)  # вернуть лимитки через проверку стакана
+                log_event(f"✅ [ШТАТНЫЙ РЕЖИМ] {pos['title'][:35]}: связь с ИИ восстановлена, лимитки вернутся после проверки стакана.")
 
-            # Проверяем: не пробила ли реальная цена наши лимитные ордера?
-            # При исполнении лимитки маркет-мейкер получает токсичный инвентарь (~shares акций)
-            # и несет убыток от гэпа за предел лимитки + половину спреда стакана на выход (adverse selection >= 0.8¢/акцию)
-            if new_mid <= pos["bid_limit"] or new_mid >= pos["ask_limit"]:
-                unit_cost = max(0.20, float(pos["bid_limit"]) + (1.0 - float(pos["ask_limit"])))
-                shares = alloc / unit_cost
-                gap = max(pos["bid_limit"] - new_mid, new_mid - pos["ask_limit"], 0.0)
-                unwind_slippage = max(float(pos.get("book_spread", 0.01)) / 2.0, 0.008)
-                penalty = round(shares * (gap + unwind_slippage), 4)
-                pos["adverse_loss_usd"] = round(pos["adverse_loss_usd"] + penalty, 4)
-                pos["rebalances_count"] += 1
-                half_c = (pos["max_spread_cents"] / 100.0) * MM_SPREAD_FRACTION
-                pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
-                pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
-                log_event(
-                    f"⚠️ ПРОБОЙ КОРИДОРА [{pos['title'][:40]}]: цена {new_mid:.4f}, списан adverse-убыток -${penalty:.2f}, ордера переставлены."
-                )
-                send_telegram_alert(
-                    f"⚠️ <b>Пробой коридора Polymarket!</b>\n"
-                    f"Рынок: <i>{esc(pos['title'])}</i>\n"
-                    f"Новая цена: <code>{new_mid:.4f}</code>\n"
-                    f"Списан убыток (adverse selection + спред): <b>-${penalty:.2f} USDC</b>\n"
-                    f"Лимитки переставлены: <code>{pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f}</code>"
-                )
-            elif hr_move >= KILL_SWITCH_MOVE or abs(new_mid - pos["current_mid"]) >= KILL_SWITCH_MOVE:
-                # Правило защиты до пробоя лимиток (порог движения цены, без вызова ИИ)
-                pos["rebalances_count"] += 1
-                half_c = (pos["max_spread_cents"] / 100.0) * MM_SPREAD_FRACTION
-                pos["bid_limit"] = max(0.01, round(new_mid - half_c, 4))
-                pos["ask_limit"] = min(0.99, round(new_mid + half_c, 4))
-                log_event(
-                    f"🛡️ KILL-SWITCH [{pos['title'][:40]}]: движение цены ({pos['current_mid']:.4f} -> {new_mid:.4f}), лимитки сдвинуты."
-                )
-                send_telegram_alert(
-                    f"🛡️ <b>Сработал Kill-Switch!</b>\n"
-                    f"Рынок: <i>{esc(pos['title'])}</i>\n"
-                    f"Цена сдвинулась: <code>{pos['current_mid']:.4f} -&gt; {new_mid:.4f}</code>\n"
-                    f"Лимитки сдвинуты до пробоя коридора."
-                )
-            pos["current_mid"] = new_mid
-
-            if maybe_reaudit(pos, "polymarket_liquidity_maker", new_mid, m.get("description") or ""):
+            if m is not None and maybe_reaudit(
+                pos, "polymarket_liquidity_maker", float(pos["current_mid"]), m.get("description") or "", "YES", pos.get("end_date", "")
+            ):
                 close_position(pos, "CLOSED_AI", "повторный аудит ИИ дважды подряд вернул SKIP — лимитки сняты")
                 continue
 
-            # Начисляем Liquidity Rewards по честному квадратичному APR из живого CLOB стакана
-            reward_gain = alloc * (float(pos["expected_apr"]) / 100.0) * elapsed_years
-            pos["accrued_rewards_usd"] = round(pos["accrued_rewards_usd"] + reward_gain, 4)
+            mm_quote_step(pos, now)
 
         elif pos["type"] == "poly_bond":
             m = find_market(pos)
@@ -749,7 +893,9 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
                 close_position(pos, "STOPPED_OUT", f"цена исхода упала до {cur_price:.4f} (< {BOND_STOP_LOSS:.2f}) — бонд продан")
                 continue
 
-            if not is_emergency and maybe_reaudit(pos, "polymarket_smart_bonding", cur_price, m.get("description") or "", outcome):
+            if not is_emergency and maybe_reaudit(
+                pos, "polymarket_smart_bonding", cur_price, m.get("description") or "", outcome, m.get("endDate") or ""
+            ):
                 close_position(pos, "CLOSED_AI", f"повторный аудит ИИ дважды подряд вернул SKIP — бонд продан по {cur_price:.4f}")
                 continue
 
@@ -832,6 +978,9 @@ def print_status() -> None:
                 f"   • Текущая цена: {p['current_mid']:.4f} | Наши лимитки: Bid {p['bid_limit']:.4f} .. Ask {p['ask_limit']:.4f} "
                 f"| Конкуренция стакана (Q): {p.get('book_quadratic_score', 0):,.0f} | Перестановок: {p['rebalances_count']}"
             )
+            if float(p.get("mm_paused_until") or 0.0) > time.time():
+                until = datetime.fromtimestamp(float(p["mm_paused_until"]), timezone.utc).strftime("%H:%M")
+                print(f"   • ⏸ Пауза после исполнения лимитки до {until} UTC (исполнений за сутки: {len(p.get('fill_times', []))})")
         elif p["type"] == "poly_bond":
             print(f"   • Вход: {p['entry_price']:.4f} | Сейчас: {p['current_price']:.4f} | Акций: {p.get('shares', 0):.2f}")
         elif p["type"] == "hl_funding" and p.get("spot_hedge"):
@@ -846,6 +995,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Paper-Trading демон с Venice AI")
     parser.add_argument("--deposit", type=float, default=5000.0)
     parser.add_argument("--interval", type=int, default=900, help="Интервал проверки в секундах (по умолчанию 900с = 15 мин)")
+    parser.add_argument("--mm-poll", type=int, default=MM_POLL_SEC, help="Интервал минутной проверки MM-слотов, сек (по умолчанию 60)")
     parser.add_argument("--once", action="store_true", help="Выполнить 1 шаг и выйти")
     parser.add_argument("--status", action="store_true", help="Показать текущий отчет")
     parser.add_argument("--reset", action="store_true", help="Пересоздать портфель заново")
@@ -863,20 +1013,32 @@ if __name__ == "__main__":
         print_status()
     else:
         failures = 0
+        fast_failures_logged_at = 0.0
+        next_full_at = 0.0
         while True:
-            try:
-                step_simulation(args.deposit)
-                if failures:
-                    log_event(f"✅ Тики снова проходят штатно (после {failures} сбоев подряд).")
-                    send_telegram_alert(f"✅ <b>Демон симуляции восстановился</b> после {failures} сбоев подряд.")
-                failures = 0
-            except Exception as exc:
-                failures += 1
-                log_event(f"❌ Сбой тика ({failures} подряд): {type(exc).__name__}: {exc}")
-                print(traceback.format_exc(), flush=True)
-                if failures in (1, 4):
-                    send_telegram_alert(
-                        f"❌ <b>Сбой тика симуляции</b> ({failures} подряд)\n"
-                        f"<code>{esc(type(exc).__name__)}: {esc(str(exc)[:200])}</code>"
-                    )
-            time.sleep(args.interval)
+            if time.time() >= next_full_at:
+                next_full_at = time.time() + args.interval
+                try:
+                    step_simulation(args.deposit)
+                    if failures:
+                        log_event(f"✅ Тики снова проходят штатно (после {failures} сбоев подряд).")
+                        send_telegram_alert(f"✅ <b>Демон симуляции восстановился</b> после {failures} сбоев подряд.")
+                    failures = 0
+                except Exception as exc:
+                    failures += 1
+                    log_event(f"❌ Сбой тика ({failures} подряд): {type(exc).__name__}: {exc}")
+                    print(traceback.format_exc(), flush=True)
+                    if failures in (1, 4):
+                        send_telegram_alert(
+                            f"❌ <b>Сбой тика симуляции</b> ({failures} подряд)\n"
+                            f"<code>{esc(type(exc).__name__)}: {esc(str(exc)[:200])}</code>"
+                        )
+            else:
+                try:
+                    fast_mm_tick()
+                except Exception as exc:
+                    print(traceback.format_exc(), flush=True)
+                    if time.time() - fast_failures_logged_at >= LOG_THROTTLE_SEC:
+                        fast_failures_logged_at = time.time()
+                        log_event(f"⚠️ Сбой минутной проверки MM: {type(exc).__name__}: {exc}")
+            time.sleep(max(1.0, min(args.mm_poll, next_full_at - time.time())))

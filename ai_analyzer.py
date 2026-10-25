@@ -261,7 +261,9 @@ def entry_budget_exhausted() -> bool:
 STRATEGY_BRIEFS = {
     "polymarket_liquidity_maker": (
         "Стратегия: ставим двусторонние лимитные ордера (bid и ask) вокруг текущей цены ради ежедневных USDC-ревардов Polymarket. "
-        "Главный риск — резкий скачок цены (новость, событие в ближайшие дни), из-за которого наши ордера исполнят информированные трейдеры."
+        "Главный риск — резкий скачок цены (новость, событие в ближайшие дни), из-за которого наши ордера исполнят информированные трейдеры. "
+        "Если рынок истекает в ближайшие дни или его исход косвенно зависит от выборов, голосований, заседаний и других событий "
+        "на этой неделе — ставь SKIP, даже если формально вопрос рынка про более поздний срок."
     ),
     "polymarket_smart_bonding": (
         "Стратегия: ПОКУПАЕМ исход [{outcome}] по цене {price:.4f} и держим до резолюции. "
@@ -275,8 +277,22 @@ STRATEGY_BRIEFS = {
 }
 
 
-def _build_audit_prompt(question: str, description: str, price_yes: float, strategy_type: str, outcome_label: str) -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _build_audit_prompt(
+    question: str, description: str, price_yes: float, strategy_type: str, outcome_label: str, end_date: str = ""
+) -> str:
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    end_line = ""
+    if end_date:
+        try:
+            end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            end_dt = end_dt if end_dt.tzinfo else end_dt.replace(tzinfo=timezone.utc)
+            end_line = (
+                f"Дата истечения рынка (endDate): {end_dt.strftime('%Y-%m-%d %H:%M')} UTC — "
+                f"через {(end_dt - now).total_seconds() / 86400.0:.1f} дн.\n"
+            )
+        except ValueError:
+            end_line = f"Дата истечения рынка (endDate): {end_date}\n"
     brief = STRATEGY_BRIEFS.get(strategy_type, f"Стратегия: {strategy_type}.").format(outcome=outcome_label, price=price_yes)
     if strategy_type == "hyperliquid_funding":
         market_block = f"Актив: {question}\nДанные: {description[:1200]}\n"
@@ -284,6 +300,7 @@ def _build_audit_prompt(question: str, description: str, price_yes: float, strat
         market_block = (
             f"Вопрос рынка: {question}\n"
             f"Рассматриваемый исход: [{outcome_label}], текущая цена ${price_yes:.4f}\n"
+            f"{end_line}"
             f"Правила резолюции: {description[:1200]}\n"
         )
     return (
@@ -357,6 +374,7 @@ def call_venice_market_audit(
     samples: int = 1,
     cache_ttl_sec: float = 10800,
     budget_reserve: int = 0,
+    end_date: str = "",
 ) -> Dict[str, Any]:
     """Вызывает Venice AI для анализа правил рынка и принятия решения APPROVE / SKIP.
 
@@ -391,7 +409,7 @@ def call_venice_market_audit(
 
     base_url = os.environ.get("VENICE_BASE_URL", "http://127.0.0.1:8787/api/v1")
     model = os.environ.get("VENICE_MODEL", "gemini-4-argon")
-    prompt = _build_audit_prompt(question, description, price_yes, strategy_type, outcome_label)
+    prompt = _build_audit_prompt(question, description, price_yes, strategy_type, outcome_label, end_date)
 
     votes: List[Dict[str, Any]] = []
     last_err = ""
