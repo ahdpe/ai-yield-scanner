@@ -21,14 +21,36 @@ DATA_TRADES_URL = "https://data-api.polymarket.com/trades?market={condition_id}&
 MM_MIN_DAYS_TO_END = 7.0
 
 
-def fetch_polymarket_markets() -> List[Dict[str, Any]]:
-    """Загружает топ-250 активных рынков Polymarket из публичного Gamma API."""
-    req = urllib.request.Request(
-        GAMMA_MARKETS_URL,
-        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def fetch_polymarket_markets(max_markets: int = 300) -> List[Dict[str, Any]]:
+    """Загружает топ-300 активных рынков Polymarket из публичного Gamma API с постраничной загрузкой."""
+    all_markets: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for offset in range(0, max_markets, 100):
+        url = (
+            "https://gamma-api.polymarket.com/markets"
+            f"?active=true&closed=false&order=volume24hr&ascending=false&limit=100&offset={offset}"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                batch = json.loads(resp.read().decode("utf-8"))
+                if not batch:
+                    break
+                for m in batch:
+                    mid = m.get("id") or m.get("conditionId") or m.get("slug")
+                    if mid and mid in seen_ids:
+                        continue
+                    if mid:
+                        seen_ids.add(mid)
+                    all_markets.append(m)
+                if len(batch) < 100:
+                    break
+        except Exception:
+            break
+    return all_markets
 
 
 def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
@@ -301,6 +323,10 @@ def scan_smart_bonding(
     candidates: List[Dict[str, Any]] = []
 
     for m in markets:
+        q = m.get("question") or ""
+        if "up or down" in q.lower():
+            continue
+
         risk_info = classify_polymarket_risk(m)
         if risk_info["is_sports"]:
             continue
@@ -333,7 +359,7 @@ def scan_smart_bonding(
             except Exception:
                 days_left = 14.0
 
-        if days_left > 30.0:
+        if days_left < 2.0 or days_left > 30.0:
             continue
 
         net_return_pct = ((1.0 - lead_price) / lead_price) * 100.0
@@ -352,7 +378,7 @@ def scan_smart_bonding(
             "book_liquidity_usd": book_liq,
             "end_date": end_str,
             "risk": risk_info,
-            "description": (m.get("description") or "")[:300],
+            "description": (m.get("description") or "")[:1200],
         })
 
     candidates.sort(key=lambda x: x["annualized_apr"], reverse=True)
