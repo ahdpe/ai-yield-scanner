@@ -56,6 +56,7 @@ MM_MIN_DAYS_TO_END_HOLD = 2.0     # открытый MM-слот снимает�
 MM_MAX_ACCRUAL_APR = 365.0        # потолок APR ревардов при начислении (1% в день)
 MM_APR_MAX_RISE_PER_HOUR = 2.0    # расчетный APR растет не быстрее чем вдвое за час (пустой стакан после обвала — не доход)
 LOG_THROTTLE_SEC = 900            # повторяющиеся служебные сообщения MM-слота — не чаще раза в 15 минут
+MM_TRADE_LOOKBACK_SEC = 900       # лента сделок Polymarket запаздывает на 1.5–4 мин: каждую проверку берем сделки за 15 мин
 
 
 def log_event(msg: str) -> None:
@@ -200,6 +201,7 @@ def _open_mm_slot(item: Dict[str, Any], slot_size: float, now: float) -> Tuple[O
         "bid_limit": item["bid_limit"],
         "ask_limit": item["ask_limit"],
         "quote_anchor_mid": mid,
+        "quote_log": [[now, item["bid_limit"], item["ask_limit"]]],
         "last_mm_check_at": now,
         "reward_apr_ref": min(float(item["conservative_apr"]), MM_MAX_ACCRUAL_APR),
         "book_spread": item.get("book_spread", 0.01),
@@ -569,12 +571,32 @@ def _log_throttled(pos: Dict[str, Any], key: str, msg: str, now: float) -> None:
         log_event(msg)
 
 
-def _place_quotes(pos: Dict[str, Any], mid: float) -> None:
+def _log_quotes(pos: Dict[str, Any], ts: float, bid: Optional[float], ask: Optional[float]) -> None:
+    """История лимиток [момент, bid, ask] для сверки с запоздавшими сделками; None — лимиток в стакане нет."""
+    history = pos.setdefault("quote_log", [])
+    history.append([ts, bid, ask])
+    cutoff = ts - MM_TRADE_LOOKBACK_SEC - 600
+    while len(history) > 1 and history[1][0] <= cutoff:  # последнее состояние до окна сохраняем
+        history.pop(0)
+
+
+def _quotes_at(pos: Dict[str, Any], ts: float) -> Optional[Tuple[float, float]]:
+    """Какие лимитки стояли в момент ts (None — их не было или слот тогда еще не котировал)."""
+    state: Optional[Tuple[float, float]] = None
+    for placed_at, bid, ask in pos.get("quote_log", []):
+        if placed_at > ts:
+            break
+        state = (bid, ask) if bid is not None else None
+    return state
+
+
+def _place_quotes(pos: Dict[str, Any], mid: float, now: float) -> None:
     """Выставляет двусторонние лимитки вокруг mid и запоминает цену выставления для Kill-Switch."""
     half_c = (float(pos["max_spread_cents"]) / 100.0) * MM_SPREAD_FRACTION
     pos["bid_limit"] = max(0.01, round(mid - half_c, 4))
     pos["ask_limit"] = min(0.99, round(mid + half_c, 4))
     pos["quote_anchor_mid"] = mid
+    _log_quotes(pos, now, pos["bid_limit"], pos["ask_limit"])
 
 
 def _accrue_mm_rewards(pos: Dict[str, Any], cur_apr: float, elapsed_sec: float) -> None:
@@ -589,52 +611,76 @@ def _accrue_mm_rewards(pos: Dict[str, Any], cur_apr: float, elapsed_sec: float) 
     pos["accrued_rewards_usd"] = round(float(pos["accrued_rewards_usd"]) + gain, 6)
 
 
-def _handle_mm_fill(pos: Dict[str, Any], bid_hit: bool, ask_hit: bool, mid: float, now: float) -> None:
-    """Лимитку исполнили: инвентарь сразу закрывается по рынку с проскальзыванием, котирование ставится на паузу."""
-    bid, ask = float(pos["bid_limit"]), float(pos["ask_limit"])
-    shares = float(pos["allocated_usd"]) / max(0.20, bid + (1.0 - ask))
+def _handle_mm_fill(
+    pos: Dict[str, Any],
+    fill_ts: float,
+    bid: float,
+    ask: float,
+    bid_hit: bool,
+    ask_hit: bool,
+    cross_prices: List[float],
+    mid: float,
+    now: float,
+) -> None:
+    """Лимитку исполнили в момент fill_ts (узнали о ней сейчас — лента запаздывает).
+    Инвентарь закрывается консервативно: по худшей из цен — текущий mid или цена пробившей сделки — плюс проскальзывание."""
+    alloc = float(pos["allocated_usd"])
+    shares = alloc / max(0.20, bid + (1.0 - ask))
     slip = max(float(pos.get("book_spread", 0.01)) / 2.0, 0.008)
     if bid_hit and ask_hit:
         pnl, what = shares * (ask - bid), f"обе лимитки ({bid:.4f} и {ask:.4f})"
     elif bid_hit:
-        pnl, what = shares * ((mid - slip) - bid), f"покупка по {bid:.4f}"
+        pnl, what = shares * ((min([mid] + cross_prices) - slip) - bid), f"покупка по {bid:.4f}"
     else:
-        pnl, what = shares * (ask - (mid + slip)), f"продажа по {ask:.4f}"
+        pnl, what = shares * (ask - (max([mid] + cross_prices) + slip)), f"продажа по {ask:.4f}"
     pnl = round(pnl, 4)
     if pnl < 0:
         pos["adverse_loss_usd"] = round(float(pos["adverse_loss_usd"]) - pnl, 4)
     else:
         pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd", 0.0)) + pnl, 4)
-    fills = [t for t in pos.get("fill_times", []) if now - float(t) < MM_FILL_WINDOW_SEC] + [now]
+
+    # Реварды, начисленные между исполнением и его появлением в ленте, списываем: лимитки уже не стояли
+    lag = max(0.0, now - fill_ts)
+    clawback = alloc * (min(float(pos.get("reward_apr_ref", 0.0)), MM_MAX_ACCRUAL_APR) / 100.0) * lag / (365.0 * 86400.0)
+    pos["accrued_rewards_usd"] = round(max(0.0, float(pos["accrued_rewards_usd"]) - clawback), 6)
+
+    # С момента исполнения лимиток в стакане нет: более поздние состояния истории (перестановки) отбрасываем
+    pos["quote_log"] = [q for q in pos.get("quote_log", []) if q[0] <= fill_ts] + [[fill_ts, None, None]]
+    fills = [t for t in pos.get("fill_times", []) if fill_ts - float(t) < MM_FILL_WINDOW_SEC] + [fill_ts]
     pos["fill_times"] = fills
     pos["rebalances_count"] = int(pos.get("rebalances_count", 0)) + 1
     pos["current_mid"] = mid
+    fill_hm = datetime.fromtimestamp(fill_ts, timezone.utc).strftime("%H:%M:%S")
     log_event(
-        f"⚠️ ИСПОЛНЕНИЕ ЛИМИТКИ [{pos['title'][:40]}]: по ленте сделок — {what}, рынок {mid:.4f}; "
-        f"инвентарь {shares:,.0f} акций закрыт, результат ${pnl:+.2f}."
+        f"⚠️ ИСПОЛНЕНИЕ ЛИМИТКИ [{pos['title'][:40]}]: по ленте сделок — {what} в {fill_hm} UTC "
+        f"(лента показала через {lag:.0f} с), рынок {mid:.4f}; инвентарь {shares:,.0f} акций закрыт, результат ${pnl:+.2f}."
     )
     if len(fills) >= MM_FILLS_TO_CLOSE:
         close_position(pos, "CLOSED_RULE", f"{len(fills)} исполнения лимиток за сутки — рынок слишком нервный для MM")
         return
-    pos["mm_paused_until"] = now + MM_FILL_PAUSE_SEC
+    pos["mm_paused_until"] = max(fill_ts + MM_FILL_PAUSE_SEC, now + MM_POLL_SEC)
     resume_at = datetime.fromtimestamp(pos["mm_paused_until"], timezone.utc).strftime("%H:%M")
     send_telegram_alert(
         f"⚠️ <b>Исполнена лимитка Polymarket</b>\n"
         f"Рынок: <i>{esc(pos['title'])}</i>\n"
-        f"Сделка: {esc(what)}, рынок сейчас <code>{mid:.4f}</code>\n"
+        f"Сделка: {esc(what)} в {fill_hm} UTC, рынок сейчас <code>{mid:.4f}</code>\n"
         f"Результат закрытия инвентаря: <b>${pnl:+.2f} USDC</b>\n"
         f"Котирование на паузе до <b>{resume_at} UTC</b>"
     )
 
 
 def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
-    """Проверка MM-слота: исполнение лимиток по ленте сделок, Kill-Switch от цены выставления, начисление ревардов."""
+    """Проверка MM-слота: исполнение лимиток по ленте сделок (с запасом на ее задержку и сверкой с историей лимиток),
+    Kill-Switch от цены выставления, начисление ревардов."""
     window_start = float(pos.get("last_mm_check_at") or now)
     elapsed_sec = min(max(0.0, now - window_start), MAX_ACCRUAL_GAP_SEC)
     pos["last_mm_check_at"] = now
     title = pos["title"][:40]
 
     paused_until = float(pos.get("mm_paused_until") or 0.0)
+    if "quote_log" not in pos:
+        # Слот открыт до появления истории лимиток: сделки раньше этого момента сверить не с чем
+        _log_quotes(pos, now, None if paused_until else pos["bid_limit"], None if paused_until else pos["ask_limit"])
     if paused_until > now:
         return  # лимитки сняты после исполнения — ни риска, ни ревардов
 
@@ -654,11 +700,22 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
         _log_throttled(pos, "book", f"⚠️ CLOB стакан [{title}] недоступен: {exc}", now)
 
     trades: Optional[List[Dict[str, Any]]] = None
+    new_trades: List[Dict[str, Any]] = []
     if pos.get("condition_id"):
         try:
-            trades = fetch_recent_trades(pos["condition_id"], window_start)
+            trades = fetch_recent_trades(pos["condition_id"], now - MM_TRADE_LOOKBACK_SEC)
         except Exception as exc:
             _log_throttled(pos, "trades", f"⚠️ Лента сделок [{title}] недоступна: {exc} — исполнение проверяется по mid.", now)
+    if trades is not None:
+        if len(trades) >= 500:
+            _log_throttled(pos, "trades500", f"⚠️ Лента сделок [{title}]: 500+ сделок за 15 мин, часть могла не попасть в проверку.", now)
+        seen = pos.get("seen_trades", {})
+        for t in trades:
+            key = f"{t.get('transactionHash')}:{t.get('asset')}:{t.get('price')}:{t.get('size')}:{t.get('timestamp')}"
+            if key not in seen:
+                seen[key] = float(t["timestamp"])
+                new_trades.append(t)
+        pos["seen_trades"] = {k: ts for k, ts in seen.items() if ts >= now - MM_TRADE_LOOKBACK_SEC - 60}
 
     if qm:
         mid = qm["mid"]
@@ -675,20 +732,32 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
             _log_throttled(pos, "resume", f"⏸ [{title}] пауза продлена: стакан пуст или спред шире зоны ревардов.", now)
             return
         pos["mm_paused_until"] = 0.0
-        _place_quotes(pos, mid)
+        _place_quotes(pos, mid, now)
         pos["current_mid"] = mid
         log_event(f"▶️ [{title}] лимитки возвращены после паузы: {pos['bid_limit']:.4f} .. {pos['ask_limit']:.4f}.")
         return
 
-    # Исполнение: любая сделка за окно по цене не хуже нашей лимитки (продажа YES ≤ bid или покупка YES ≥ ask)
-    bid, ask = float(pos["bid_limit"]), float(pos["ask_limit"])
+    # Исполнение: новая (ранее не виденная) сделка по цене не хуже лимитки, которая стояла в момент этой сделки
+    fill = None
     if trades is not None:
-        prices = [trade_yes_price(t) for t in trades]
-        bid_hit, ask_hit = any(px <= bid for px in prices), any(px >= ask for px in prices)
+        for t in sorted(new_trades, key=lambda x: float(x["timestamp"])):
+            ts = float(t["timestamp"])
+            quotes = _quotes_at(pos, ts)
+            if not quotes:
+                continue
+            bid, ask = quotes
+            px = trade_yes_price(t)
+            if px <= bid or px >= ask:
+                same = [trade_yes_price(x) for x in new_trades if float(x["timestamp"]) == ts]
+                cross = [q for q in same if q <= bid or q >= ask]
+                fill = (ts, bid, ask, any(q <= bid for q in same), any(q >= ask for q in same), cross)
+                break
     else:
-        bid_hit, ask_hit = mid <= bid, mid >= ask
-    if bid_hit or ask_hit:
-        _handle_mm_fill(pos, bid_hit, ask_hit, mid, now)
+        bid, ask = float(pos["bid_limit"]), float(pos["ask_limit"])
+        if mid <= bid or mid >= ask:
+            fill = (now, bid, ask, mid <= bid, mid >= ask, [mid])
+    if fill:
+        _handle_mm_fill(pos, *fill, mid=mid, now=now)
         return  # за окно с исполнением реварды не начисляются
 
     if qm:
@@ -699,7 +768,7 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
     # Kill-Switch: переставляем лимитки, если цена ушла на ≥1¢ от цены, при которой они выставлены
     anchor = float(pos.get("quote_anchor_mid") or pos["current_mid"])
     if abs(mid - anchor) >= KILL_SWITCH_MOVE:
-        _place_quotes(pos, mid)
+        _place_quotes(pos, mid, now)
         pos["rebalances_count"] = int(pos.get("rebalances_count", 0)) + 1
         pos["ks_pending"] = int(pos.get("ks_pending", 0)) + 1
         if now - float(pos.get("ks_logged_at", 0.0)) >= LOG_THROTTLE_SEC:
@@ -854,6 +923,7 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
                 # В аварийном режиме (нет связи с Venice AI) лимитки сняты: окно паузы не начисляется
                 if not pos.get("mm_defensive_paused", False):
                     pos["mm_defensive_paused"] = True
+                    _log_quotes(pos, now, None, None)
                     log_event(f"🛡️ [АВАРИЙНЫЙ РЕЖИМ] {pos['title'][:35]}: лимитки сняты для защиты капитала.")
                 pos["last_mm_check_at"] = now
                 continue
