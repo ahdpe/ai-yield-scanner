@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Yield Scanner Interactive Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ai_yield_scanner
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 %h/ai_yield_scanner/telegram_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

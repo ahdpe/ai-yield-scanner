@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Yield Scanner & Paper-Trading Daemon ($5000 USDC, Venice AI)
+After=network-online.target venice-budget-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ai_yield_scanner
+Environment=PYTHONUNBUFFERED=1
+Environment=VENICE_BASE_URL=http://127.0.0.1:8787/api/v1
+Environment=VENICE_MODEL=gemini-4-argon
+ExecStart=/usr/bin/python3 %h/ai_yield_scanner/paper_trader.py --deposit 5000 --interval 900
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

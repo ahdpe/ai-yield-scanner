@@ -89,7 +89,7 @@
 
 ---
 
-## 4. Архитектура служб на сервере Hermes (`user@your-server`)
+## 4. Архитектура служб на сервере
 
 На сервере работают три изолированные службы `systemd --user`:
 1. **`venice-budget-proxy.service`** — локальный шлюз к Venice AI (`127.0.0.1:8787`), контролирующий суточный резерв DIEM.
@@ -129,7 +129,7 @@
 
 ```bash
 # 1. Проверить текущий отчет портфеля:
-ssh user@your-server "~/ai_yield_scanner/paper_trader.py --status"
+ssh user@your-server "cd ~/ai_yield_scanner && python3 paper_trader.py --status"
 
 # 2. Посмотреть статус фоновых служб:
 ssh user@your-server "systemctl --user status ai-yield-paper.service ai-yield-bot.service --no-pager"

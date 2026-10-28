@@ -1,0 +1,5 @@
+{
+  "bot_token": "123456789:REPLACE_WITH_YOUR_BOT_TOKEN",
+  "admin_chat_id": "REPLACE_WITH_YOUR_TELEGRAM_USER_ID",
+  "alerts_enabled": true
+}
