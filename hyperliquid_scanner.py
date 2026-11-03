@@ -72,7 +72,7 @@ def fetch_hl_spot_hedge_map(min_spot_vol_usd: float = 100_000.0) -> Dict[str, Di
 
 def scan_funding_anomalies(
     min_oi_usd: float = 15_000_000.0,
-    min_abs_apr: float = 18.0,
+    min_abs_apr: float = 30.0,
     require_hl_spot_hedge: bool = True,
 ) -> List[Dict[str, Any]]:
     """Находит крупные рынки Hyperliquid с положительным фандингом, проверяет наличие
@@ -113,6 +113,9 @@ def scan_funding_anomalies(
         })
         rates = [float(x["fundingRate"]) for x in hist] if hist else [cur_fr]
         avg_72h_apr = (sum(rates) / len(rates)) * 24.0 * 365.0 * 100.0
+
+        if avg_72h_apr < min_abs_apr:
+            continue
 
         if cur_apr > 0:
             same_sign_hours = sum(1 for r in rates if r > 0)

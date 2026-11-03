@@ -47,7 +47,10 @@ HL_ADVERSE_TICKS_TO_CLOSE = 2     # закрываем фандинг после
 MAX_ACCRUAL_GAP_SEC = 3600        # дольше часа без наблюдения рынка доход не начисляем
 REOPEN_COOLDOWN_SEC = 12 * 3600   # не переоткрываем закрытый рынок в течение 12 часов
 REFILL_FRESH_AUDITS_PER_STRATEGY = 1  # за тик — не больше 1 нового кандидата на стратегию (≤3 платных проверки)
-MM_SPREAD_FRACTION = 0.65         # отступ наших лимиток от mid в долях rewardsMaxSpread
+MM_SPREAD_FRACTION = 0.78         # отступ наших лимиток от mid в долях rewardsMaxSpread (глубже в стакан для защиты от шума)
+TARGET_BOND_SLOTS = 3             # целевое число надежных слотов Smart Bonding (основной источник профита)
+TARGET_MM_SLOTS = 1               # не более 1 строго проверенного MM-слота с плотным стаканом
+TARGET_HL_SLOTS = 1               # не более 1 слота фандинга (только если APR >= 30% и есть спот-хедж)
 MM_POLL_SEC = 60                  # между полными тиками стакан и лента сделок MM-слотов проверяются раз в минуту
 MM_FILL_PAUSE_SEC = 3 * 3600      # после исполнения лимитки котирование рынка на паузе 3 часа
 MM_FILLS_TO_CLOSE = 2             # второе исполнение за сутки — слот закрывается, капитал уходит в другой рынок
@@ -310,28 +313,40 @@ def init_portfolio(deposit_usd: float = 5000.0) -> Dict[str, Any]:
     slot_size = deposit_usd / 5.0
     now = time.time()
 
-    # Слоты 1-3: Polymarket Liquidity Rewards ($3,000)
-    for item in reward_candidates:
-        if len([p for p in positions if p["type"] == "poly_mm"]) >= 3:
-            break
-        pos, _ = _open_mm_slot(item, slot_size, now)
-        if pos:
-            positions.append(pos)
-
-    # Слот 4: Polymarket Smart Bonding ($1,000)
+    # Слоты 1-3: Приоритет Polymarket Smart Bonding (до 3 слотов по $1,000)
     for b in bonding_candidates:
+        if len([p for p in positions if p["type"] == "poly_bond"]) >= TARGET_BOND_SLOTS:
+            break
         pos, _ = _open_bond_slot(b, slot_size, now)
         if pos:
             positions.append(pos)
-            break
 
-    # Слот 5: Hyperliquid Funding Anomaly ($1,000) — только со спот-хеджем на Hyperliquid и после аудита ИИ
+    # Слот 4: Hyperliquid Funding Anomaly ($1,000) — только если APR >= 30% и есть нативный спот-хедж
     for c in hl_candidates[:3]:
         pos, _ = _open_hl_slot(c, slot_size, now)
         if pos:
             positions.append(pos)
             log_event(f"Открыт слот Hyperliquid {c['coin']} (списана комиссия входа -${pos['adverse_loss_usd']:.2f}).")
             break
+
+    # Слот 5: Polymarket Liquidity Rewards (максимум 1 слот $1,000, плотный стакан Q >= 4000)
+    for item in reward_candidates:
+        if len([p for p in positions if p["type"] == "poly_mm"]) >= TARGET_MM_SLOTS:
+            break
+        pos, _ = _open_mm_slot(item, slot_size, now)
+        if pos:
+            positions.append(pos)
+
+    # Если позиций все еще меньше 5 (например нет качественного фандинга) — добираем бондами
+    if len(positions) < 5:
+        for b in bonding_candidates:
+            if len(positions) >= 5:
+                break
+            if any(p.get("slug") == b.get("slug") for p in positions):
+                continue
+            pos, _ = _open_bond_slot(b, slot_size, now)
+            if pos:
+                positions.append(pos)
 
     state = {
         "schema": 4,
@@ -401,26 +416,8 @@ def refill_open_slots(
                     break
         return None, True
 
-    # За один тик открываем не более 1 новой позиции и делаем не более 1 свежего аудита на стратегию
-    if poly_ok and open_mm < 3:
-        pos, go_on = try_candidates(
-            scan_liquidity_rewards(markets, deposit_usd=slot_size, min_safety_score=75),
-            _open_mm_slot,
-            lambda c: c["slug"] in blocked_slugs,
-        )
-        if pos:
-            state["positions"].append(pos)
-            log_event(f"♻️ Перераспределение капитала: открыт новый MM-слот [{pos['title'][:45]}] с квадратичным APR {pos['expected_apr']:.1f}%.")
-            send_telegram_alert(
-                f"♻️ <b>Открыт новый MM-слот ($1,000)</b>\n"
-                f"Рынок: <i>{esc(pos['title'])}</i>\n"
-                f"Честный квадратичный APR (CLOB): <code>{pos['expected_apr']:.1f}%</code>"
-            )
-            return
-        if not go_on:
-            return
-
-    if poly_ok and open_bond < 1:
+    # Приоритет 1: Заполняем слоты Smart Bonding до TARGET_BOND_SLOTS (3 слота)
+    if poly_ok and open_bond < TARGET_BOND_SLOTS:
         pos, go_on = try_candidates(
             scan_smart_bonding(markets, deposit_usd=slot_size),
             _open_bond_slot,
@@ -438,9 +435,10 @@ def refill_open_slots(
         if not go_on:
             return
 
-    if hl_ok and open_hl < 1:
+    # Приоритет 2: Качественный Hyperliquid фандинг (только если APR >= 30% и есть спот-хедж)
+    if hl_ok and open_hl < TARGET_HL_SLOTS:
         try:
-            hl_cands = [a for a in scan_funding_anomalies(require_hl_spot_hedge=True) if a["same_sign_pct_72h"] >= 60.0]
+            hl_cands = [a for a in scan_funding_anomalies(min_abs_apr=30.0, require_hl_spot_hedge=True) if a["same_sign_pct_72h"] >= 60.0]
         except Exception:
             hl_cands = []
         pos, _ = try_candidates(hl_cands[:3], _open_hl_slot, lambda c: c["coin"] in blocked_coins)
@@ -452,6 +450,43 @@ def refill_open_slots(
                 f"Позиция: <i>{esc(pos['title'])}</i>\n"
                 f"Чистый APR на капитал: <code>{pos['expected_apr']:.1f}%</code>"
             )
+            return
+
+    # Приоритет 3: Не более 1 строго проверенного MM-слота с плотным стаканом
+    if poly_ok and open_mm < TARGET_MM_SLOTS:
+        pos, go_on = try_candidates(
+            scan_liquidity_rewards(markets, deposit_usd=slot_size, min_safety_score=75),
+            _open_mm_slot,
+            lambda c: c["slug"] in blocked_slugs,
+        )
+        if pos:
+            state["positions"].append(pos)
+            log_event(f"♻️ Перераспределение капитала: открыт новый MM-слот [{pos['title'][:45]}] с квадратичным APR {pos['expected_apr']:.1f}%.")
+            send_telegram_alert(
+                f"♻️ <b>Открыт новый MM-слот ($1,000)</b>\n"
+                f"Рынок: <i>{esc(pos['title'])}</i>\n"
+                f"Честный квадратичный APR (CLOB): <code>{pos['expected_apr']:.1f}%</code>"
+            )
+            return
+        if not go_on:
+            return
+
+    # Запасной вариант: если фандинг или MM не нашли кандидатов, добираем капитал надежными бондами (до 5 слотов)
+    if poly_ok and len(open_pos) < 5 and open_bond < 5:
+        pos, go_on = try_candidates(
+            scan_smart_bonding(markets, deposit_usd=slot_size),
+            _open_bond_slot,
+            lambda b: b["slug"] in blocked_slugs,
+        )
+        if pos:
+            state["positions"].append(pos)
+            log_event(f"♻️ Резервный добор капитала: открыт дополнительный бонд [{pos['title'][:45]}] по ${pos['entry_price']:.4f}.")
+            send_telegram_alert(
+                f"♻️ <b>Открыт дополнительный бонд-слот ($1,000)</b>\n"
+                f"Рынок: <i>{esc(pos['title'])}</i>\n"
+                f"Вход: <code>{pos['entry_price']:.4f}</code> (APR к погашению: <code>{pos['expected_apr']:.1f}%</code>)"
+            )
+            return
 
 
 def migrate_state(
