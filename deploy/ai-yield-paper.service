@@ -10,6 +10,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=VENICE_BASE_URL=http://127.0.0.1:8787/api/v1
 Environment=VENICE_MODEL=gemini-4-argon
 ExecStart=/usr/bin/python3 %h/ai_yield_scanner/paper_trader.py --deposit 5000 --interval 900
+ExecStopPost=/usr/bin/python3 %h/ai_yield_scanner/service_exit_alert.py %n
 Restart=always
 RestartSec=15
 

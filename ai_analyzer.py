@@ -11,6 +11,7 @@ from typing import Dict, Any, List
 
 from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
+from error_alerts import daemon_alerts
 
 
 AI_HEALTH_FILE = STATE_DIR / "ai_health.json"
@@ -435,6 +436,8 @@ def call_venice_market_audit(
         except Exception as exc:
             last_err = str(exc)
             update_ai_health(success=False, error=last_err, latency=0.0)
+            # Пинг /models бесплатный и может проходить, даже когда платные вызовы падают (например, кончился DIEM)
+            daemon_alerts.problem("venice_audit", "аудит Venice AI не проходит, новые входы заблокированы", last_err)
             break
         update_ai_health(success=True, latency=vote["latency_sec"])
         votes.append(vote)

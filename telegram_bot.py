@@ -11,6 +11,7 @@ from telegram_notifier import load_tg_config, tg_api_call, tg_send_message
 from ai_analyzer import get_ai_budget, get_ai_health, ping_venice_ai
 from paper_trader import is_open, portfolio_totals, position_net_pnl
 from state_io import STATE_DIR, esc
+from error_alerts import bot_alerts
 
 
 STATE_FILE = STATE_DIR / "portfolio_state.json"
@@ -338,9 +339,14 @@ class SimpleTelegramBot:
                             self.answer_callback(cb_id, text=pop_text)
                             self.send_menu(chat_id, format_emergency_msg())
 
-            except Exception:
+            except Exception as exc:
                 print(f"[bot] ошибка обработки обновлений:\n{traceback.format_exc()}", flush=True)
+                bot_alerts.problem(
+                    "bot_handler", "сбой обработки команды Telegram-бота (ошибка в коде)",
+                    f"{type(exc).__name__}: {exc}", immediate=True,
+                )
                 time.sleep(3)
+            bot_alerts.sweep()
 
 
 if __name__ == "__main__":

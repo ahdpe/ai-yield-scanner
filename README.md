@@ -55,6 +55,12 @@ Only coins with a liquid Hyperliquid spot hedge (≥ $100k daily volume) and pos
 - **Budget control.** There is a hard cap of 40 paid calls per UTC day, of which 16 are reserved for re-audits. Slot refill checks at most one new candidate per strategy per tick, and cached verdicts are reused for free. A typical call costs ~0.003 DIEM.
 - **Emergency mode.** A free `/models` heartbeat runs every tick. Two consecutive failures pause all MM quoting until the connection recovers.
 
+### Error alerts (Telegram)
+
+- **Persistent API failures** (Gamma, CLOB order book, Data API trade tape, Hyperliquid, Venice audits, or missing data for an open position) trigger an alert once they have kept recurring for 20 minutes. One-off errors such as a single 403 stay silent. A reminder follows every 6 hours, and a "recovered" message is sent once the error has stopped for 15 minutes.
+- **Code errors** inside the daemon's or the bot's loop are reported immediately.
+- **Process crashes.** `service_exit_alert.py` runs as the units' `ExecStopPost` hook and reports any non-clean exit with the last journal lines (at most one message per 30 minutes during a crash loop). It uses only the standard library, so it works even when the main code fails to import.
+
 ## Project layout
 
 | File | Purpose |
@@ -65,6 +71,8 @@ Only coins with a liquid Hyperliquid spot hedge (≥ $100k daily volume) and pos
 | `ai_analyzer.py` | Heuristic risk filter, Venice AI audit, consensus, daily budget, health tracking |
 | `telegram_bot.py` | Interactive Telegram bot (portfolio, AI verdicts, logs, settings) |
 | `telegram_notifier.py` | Alert delivery with HTML escaping and plain-text fallback |
+| `error_alerts.py` | Tracks recurring errors and sends problem / reminder / recovered alerts |
+| `service_exit_alert.py` | systemd `ExecStopPost` hook that reports service crashes |
 | `state_io.py` | Atomic JSON writes and HTML escaping |
 | `run_scanner.py` | One-off market scan in the terminal |
 | `deploy/` | systemd unit templates and configuration examples |

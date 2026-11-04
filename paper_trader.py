@@ -17,6 +17,7 @@ from ai_analyzer import (
 )
 from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
+from error_alerts import daemon_alerts
 from polymarket_scanner import (
     compute_quadratic_mm_metrics,
     days_until,
@@ -743,6 +744,7 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
             )
     except Exception as exc:
         _log_throttled(pos, "book", f"⚠️ CLOB стакан [{title}] недоступен: {exc}", now)
+        daemon_alerts.problem("clob", "стакан CLOB Polymarket недоступен, реварды MM не начисляются", f"[{title}] {exc}", now=now)
 
     trades: Optional[List[Dict[str, Any]]] = None
     new_trades: List[Dict[str, Any]] = []
@@ -751,6 +753,10 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
             trades = fetch_recent_trades(pos["condition_id"], now - MM_TRADE_LOOKBACK_SEC)
         except Exception as exc:
             _log_throttled(pos, "trades", f"⚠️ Лента сделок [{title}] недоступна: {exc} — исполнение проверяется по mid.", now)
+            daemon_alerts.problem(
+                "trades", "лента сделок Polymarket (Data API) недоступна, исполнения MM проверяются только по mid",
+                f"[{title}] {exc}", now=now,
+            )
     if trades is not None:
         if len(trades) >= 500:
             _log_throttled(pos, "trades500", f"⚠️ Лента сделок [{title}]: 500+ сделок за 15 мин, часть могла не попасть в проверку.", now)
@@ -899,6 +905,7 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
         poly_ok = True
     except Exception as exc:
         log_event(f"⚠️ Polymarket Gamma API недоступен: {exc}. Реварды Polymarket за этот тик не начисляются.")
+        daemon_alerts.problem("gamma", "Polymarket Gamma API недоступен, слоты Polymarket не обновляются", str(exc), now=now)
         markets, poly_ok = [], False
     by_slug = {m.get("slug"): m for m in markets if m.get("slug")}
     by_q = {m.get("question"): m for m in markets if m.get("question")}
@@ -915,6 +922,10 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
         if m is None:
             pos["stale_ticks"] = int(pos.get("stale_ticks", 0)) + 1
             log_event(f"⚠️ Нет актуальных данных по [{pos['title'][:40]}] — тик {pos['stale_ticks']} без начислений.")
+            daemon_alerts.problem(
+                f"stale:{pos['id']}", f"нет данных по рынку открытой позиции [{pos['title'][:60]}]",
+                f"{pos['stale_ticks']} тиков подряд без данных Gamma API, позиция не обновляется", now=now,
+            )
         else:
             pos["stale_ticks"] = 0
             if not pos.get("slug") and m.get("slug"):
@@ -930,6 +941,7 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
         }
     except Exception as exc:
         log_event(f"⚠️ Hyperliquid API недоступен: {exc}. Фандинг за этот тик не начисляется.")
+        daemon_alerts.problem("hyperliquid", "Hyperliquid API недоступен, фандинг не начисляется", str(exc), now=now)
         hl_map = None
 
     for pos in state["positions"]:
@@ -1135,6 +1147,8 @@ if __name__ == "__main__":
         failures = 0
         fast_failures_logged_at = 0.0
         next_full_at = 0.0
+        # Ошибки полного тика повторяются раз в --interval: проблема снимается, только если ее не было 2.5 интервала
+        daemon_alerts.clear_after = max(daemon_alerts.clear_after, 2.5 * args.interval)
         while True:
             if time.time() >= next_full_at:
                 next_full_at = time.time() + args.interval
@@ -1161,4 +1175,8 @@ if __name__ == "__main__":
                     if time.time() - fast_failures_logged_at >= LOG_THROTTLE_SEC:
                         fast_failures_logged_at = time.time()
                         log_event(f"⚠️ Сбой минутной проверки MM: {type(exc).__name__}: {exc}")
+                    daemon_alerts.problem(
+                        "fast_tick", "сбой минутной проверки MM (ошибка в коде)", f"{type(exc).__name__}: {exc}", immediate=True,
+                    )
+            daemon_alerts.sweep()
             time.sleep(max(1.0, min(args.mm_poll, next_full_at - time.time())))
