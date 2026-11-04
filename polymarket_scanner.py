@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import json
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, Any, List, Optional, Tuple
@@ -13,9 +14,11 @@ GAMMA_MARKETS_URL = (
     "https://gamma-api.polymarket.com/markets"
     "?active=true&closed=false&order=volume24hr&ascending=false&limit=250"
 )
-GAMMA_MARKET_BY_SLUG_URL = "https://gamma-api.polymarket.com/markets?slug={slug}"
+# Путь /markets/slug/{slug} отдает и открытые, и закрытые рынки (фильтр ?slug= закрытые больше не возвращает)
+GAMMA_MARKET_BY_SLUG_URL = "https://gamma-api.polymarket.com/markets/slug/{slug}"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book?token_id={token_id}"
-DATA_TRADES_URL = "https://data-api.polymarket.com/trades?market={condition_id}&limit={limit}"
+# Data API v1 (/trades?market=) отключен 2026-11-02 (HTTP 410); v2: ответ в {"data": [...]}, поля snake_case
+DATA_TRADES_URL = "https://data-api.polymarket.com/v2/trades?condition={condition_id}&limit={limit}"
 
 # MM только на рынках, до истечения которых не меньше недели: ближе к дате резолюции растет риск новостного обвала
 MM_MIN_DAYS_TO_END = 7.0
@@ -37,9 +40,16 @@ def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
         GAMMA_MARKET_BY_SLUG_URL.format(slug=urllib.parse.quote(slug, safe="")),
         headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data[0] if data else None
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data if isinstance(data, dict) and data.get("slug") else None
 
 
 def fetch_clob_book(token_id: str) -> Optional[Dict[str, Any]]:
@@ -68,20 +78,26 @@ def days_until(end_str: str) -> Optional[float]:
 
 
 def fetch_recent_trades(condition_id: str, since_ts: float, limit: int = 500) -> List[Dict[str, Any]]:
-    """Сделки рынка (обе стороны: YES и NO) строго после since_ts из публичной ленты Polymarket Data API."""
+    """Сделки рынка (обе стороны: YES и NO) строго после since_ts из публичной ленты Polymarket Data API v2.
+    Лента отсортирована от новых к старым; каждое исполнение приходит один раз, со стороны тейкера."""
     req = urllib.request.Request(
         DATA_TRADES_URL.format(condition_id=urllib.parse.quote(condition_id, safe=""), limit=limit),
         headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
-        trades = json.loads(resp.read().decode("utf-8"))
+        body = json.loads(resp.read().decode("utf-8"))
+    trades = body.get("data") if isinstance(body, dict) else None
+    if trades is None:
+        if isinstance(body, dict) and "data" not in body:
+            raise ValueError(f"неожиданный ответ Data API: {str(body)[:200]}")
+        trades = []  # v2 сообщает об отсутствии данных как data: null
     return [t for t in trades if float(t.get("timestamp") or 0) > since_ts]
 
 
 def trade_yes_price(trade: Dict[str, Any]) -> float:
     """Цена сделки в терминах первого исхода (YES): покупка NO по p равна продаже YES по 1 - p."""
     price = float(trade["price"])
-    return price if int(trade.get("outcomeIndex", 0)) == 0 else 1.0 - price
+    return price if int(trade["outcome_index"]) == 0 else 1.0 - price
 
 
 def parse_clob_token_ids(m: Dict[str, Any]) -> List[str]:

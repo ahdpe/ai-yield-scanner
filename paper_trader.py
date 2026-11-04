@@ -146,6 +146,16 @@ def market_trading_finished(m: Dict[str, Any]) -> bool:
     return False
 
 
+def market_resolved(m: Dict[str, Any]) -> bool:
+    """Исход подтвержден: рынок закрыт и оракул UMA разрешил его (или цены исходов уже ровно 0/1)."""
+    if not m.get("closed"):
+        return False
+    if str(m.get("umaResolutionStatus") or "").lower() == "resolved":
+        return True
+    _, prices = parse_outcome_prices(m)
+    return bool(prices) and all(p in (0.0, 1.0) for p in prices)
+
+
 def hl_funding_brief(c: Dict[str, Any]) -> str:
     spot = c.get("spot_hedge") or {}
     spot_txt = (
@@ -746,7 +756,7 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
             _log_throttled(pos, "trades500", f"⚠️ Лента сделок [{title}]: 500+ сделок за 15 мин, часть могла не попасть в проверку.", now)
         seen = pos.get("seen_trades", {})
         for t in trades:
-            key = f"{t.get('transactionHash')}:{t.get('asset')}:{t.get('price')}:{t.get('size')}:{t.get('timestamp')}"
+            key = f"{t.get('transaction_hash')}:{t.get('token_id')}:{t.get('price')}:{t.get('size')}:{t.get('timestamp')}"
             if key not in seen:
                 seen[key] = float(t["timestamp"])
                 new_trades.append(t)
@@ -984,10 +994,15 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
             shares = float(pos["shares"])
             pos["current_price"] = cur_price
 
-            if m.get("closed"):
+            if market_resolved(m):
                 payout = 1.0 if cur_price >= 0.5 else 0.0
                 pos["unrealized_pnl_usd"] = round(shares * (payout - float(pos["entry_price"])), 4)
                 close_position(pos, "RESOLVED", f"рынок разрешен, выплата ${payout:.2f} за акцию")
+                continue
+            if market_trading_finished(m):
+                # Торги остановлены, но оракул UMA еще не подтвердил исход: держим до выплаты, продать уже нельзя
+                pos["unrealized_pnl_usd"] = round(shares * (cur_price - float(pos["entry_price"])), 4)
+                _log_throttled(pos, "uma", f"⏳ [{pos['title'][:40]}] торги закрыты, ждем резолюции UMA (цена {cur_price:.4f}).", now)
                 continue
 
             # Переоценка по рынку (mark-to-market) вместо линейного APR
