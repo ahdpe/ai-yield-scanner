@@ -77,6 +77,7 @@ Only coins with a liquid Hyperliquid spot hedge (≥ $100k daily volume) and pos
 | `run_scanner.py` | One-off market scan in the terminal |
 | `deploy/` | systemd unit templates and configuration examples |
 | `MANUAL.md` | Detailed technical manual (Russian) |
+| `AGENTS.md` | Working rules for coding agents: deployment, state, secrets, experiment rules, API notes |
 
 The code uses only the Python standard library (3.10+).
 
