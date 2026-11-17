@@ -49,9 +49,9 @@ MAX_ACCRUAL_GAP_SEC = 3600        # дольше часа без наблюде�
 REOPEN_COOLDOWN_SEC = 12 * 3600   # не переоткрываем закрытый рынок в течение 12 часов
 REFILL_FRESH_AUDITS_PER_STRATEGY = 1  # за тик — не больше 1 нового кандидата на стратегию (≤3 платных проверки)
 MM_SPREAD_FRACTION = 0.78         # отступ наших лимиток от mid в долях rewardsMaxSpread (глубже в стакан для защиты от шума)
-TARGET_BOND_SLOTS = 3             # целевое число надежных слотов Smart Bonding (основной источник профита)
-TARGET_MM_SLOTS = 1               # не более 1 строго проверенного MM-слота с плотным стаканом
-TARGET_HL_SLOTS = 1               # не более 1 слота фандинга (только если APR >= 30% и есть спот-хедж)
+TARGET_BOND_SLOTS = 5             # все 5 слотов под надежные предрезолюционные бонды (Smart Bonding)
+TARGET_MM_SLOTS = 0               # стратегия MM отключена (капитал переведен в Smart Bonding)
+TARGET_HL_SLOTS = 0               # стратегия фандинга отключена (капитал переведен в Smart Bonding)
 MM_POLL_SEC = 60                  # между полными тиками стакан и лента сделок MM-слотов проверяются раз в минуту
 MM_FILL_PAUSE_SEC = 3 * 3600      # после исполнения лимитки котирование рынка на паузе 3 часа
 MM_FILLS_TO_CLOSE = 2             # второе исполнение за сутки — слот закрывается, капитал уходит в другой рынок
@@ -324,7 +324,7 @@ def init_portfolio(deposit_usd: float = 5000.0) -> Dict[str, Any]:
     slot_size = deposit_usd / 5.0
     now = time.time()
 
-    # Слоты 1-3: Приоритет Polymarket Smart Bonding (до 3 слотов по $1,000)
+    # Слоты 1-5: Приоритет Polymarket Smart Bonding (до 5 слотов по $1,000)
     for b in bonding_candidates:
         if len([p for p in positions if p["type"] == "poly_bond"]) >= TARGET_BOND_SLOTS:
             break
@@ -333,20 +333,24 @@ def init_portfolio(deposit_usd: float = 5000.0) -> Dict[str, Any]:
             positions.append(pos)
 
     # Слот 4: Hyperliquid Funding Anomaly ($1,000) — только если APR >= 30% и есть нативный спот-хедж
-    for c in hl_candidates[:3]:
-        pos, _ = _open_hl_slot(c, slot_size, now)
-        if pos:
-            positions.append(pos)
-            log_event(f"Открыт слот Hyperliquid {c['coin']} (списана комиссия входа -${pos['adverse_loss_usd']:.2f}).")
-            break
+    if TARGET_HL_SLOTS > 0:
+        for c in hl_candidates[:3]:
+            if len([p for p in positions if p["type"] == "hl_funding"]) >= TARGET_HL_SLOTS:
+                break
+            pos, _ = _open_hl_slot(c, slot_size, now)
+            if pos:
+                positions.append(pos)
+                log_event(f"Открыт слот Hyperliquid {c['coin']} (списана комиссия входа -${pos['adverse_loss_usd']:.2f}).")
+                break
 
     # Слот 5: Polymarket Liquidity Rewards (максимум 1 слот $1,000, плотный стакан Q >= 4000)
-    for item in reward_candidates:
-        if len([p for p in positions if p["type"] == "poly_mm"]) >= TARGET_MM_SLOTS:
-            break
-        pos, _ = _open_mm_slot(item, slot_size, now)
-        if pos:
-            positions.append(pos)
+    if TARGET_MM_SLOTS > 0:
+        for item in reward_candidates:
+            if len([p for p in positions if p["type"] == "poly_mm"]) >= TARGET_MM_SLOTS:
+                break
+            pos, _ = _open_mm_slot(item, slot_size, now)
+            if pos:
+                positions.append(pos)
 
     # Если позиций все еще меньше 5 (например нет качественного фандинга) — добираем бондами
     if len(positions) < 5:
@@ -834,7 +838,7 @@ def mm_quote_step(pos: Dict[str, Any], now: float) -> None:
 
 def fast_mm_tick() -> None:
     """Минутная проверка открытых MM-слотов между полными тиками: только стакан и лента сделок, без Gamma API и без ИИ."""
-    if not STATE_FILE.exists() or get_ai_health().get("emergency_mode", False):
+    if TARGET_MM_SLOTS == 0 or not STATE_FILE.exists() or get_ai_health().get("emergency_mode", False):
         return
     state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     active = [
@@ -950,6 +954,9 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
         alloc = float(pos["allocated_usd"])
 
         if pos["type"] == "poly_mm":
+            if TARGET_MM_SLOTS == 0:
+                close_position(pos, "CLOSED_RULE", "стратегия MM отключена — слот переведен в Smart Bonding")
+                continue
             m = find_market(pos)
             if m is not None:
                 if market_trading_finished(m):
@@ -1032,6 +1039,9 @@ def step_simulation(deposit_usd: float = 5000.0) -> Dict[str, Any]:
                 continue
 
         elif pos["type"] == "hl_funding":
+            if TARGET_HL_SLOTS == 0:
+                close_position(pos, "CLOSED_RULE", "стратегия фандинга отключена — слот переведен в Smart Bonding")
+                continue
             if hl_map is None:
                 continue
             coin = pos["coin"]
