@@ -25,11 +25,12 @@ THROTTLE_SEC = 30 * 60
 
 
 def journal_tail(unit: str, lines: int = 12) -> str:
+    cmd = ["journalctl"]
+    if os.geteuid() != 0:
+        cmd.append("--user")
+    cmd.extend(["-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"])
     try:
-        out = subprocess.run(
-            ["journalctl", "--user", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
     except Exception:
         return ""
     return out.strip()[-1500:]

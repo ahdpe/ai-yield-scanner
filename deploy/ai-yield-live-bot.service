@@ -1,0 +1,17 @@
+[Unit]
+Description=Polymarket Live Telegram Bot
+After=network-online.target ai-yield-live.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_DIR__
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=__PROJECT_DIR__/state/live_config.env
+ExecStart=__PROJECT_DIR__/venv/bin/python3 __PROJECT_DIR__/telegram_bot.py
+ExecStopPost=/usr/bin/python3 __PROJECT_DIR__/service_exit_alert.py %n
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

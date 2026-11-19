@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,9 +11,11 @@ from typing import Dict, Any, List, Optional, Tuple
 from ai_analyzer import classify_polymarket_risk
 
 
+GAMMA_MARKETS_PAGE_SIZE = 100
+GAMMA_MARKETS_DEFAULT_LIMIT = 500
 GAMMA_MARKETS_URL = (
     "https://gamma-api.polymarket.com/markets"
-    "?active=true&closed=false&order=volume24hr&ascending=false&limit=250"
+    "?active=true&closed=false&order=volume24hr&ascending=false&limit={limit}&offset={offset}"
 )
 # Путь /markets/slug/{slug} отдает и открытые, и закрытые рынки (фильтр ?slug= закрытые больше не возвращает)
 GAMMA_MARKET_BY_SLUG_URL = "https://gamma-api.polymarket.com/markets/slug/{slug}"
@@ -24,14 +27,44 @@ DATA_TRADES_URL = "https://data-api.polymarket.com/v2/trades?condition={conditio
 MM_MIN_DAYS_TO_END = 7.0
 
 
-def fetch_polymarket_markets() -> List[Dict[str, Any]]:
-    """Загружает топ-250 активных рынков Polymarket из публичного Gamma API."""
-    req = urllib.request.Request(
-        GAMMA_MARKETS_URL,
-        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def fetch_polymarket_markets(
+    limit: int = GAMMA_MARKETS_DEFAULT_LIMIT,
+    page_size: int = GAMMA_MARKETS_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    """Загружает топ-N активных рынков Polymarket постранично (Gamma API отдает до 100 на страницу)."""
+    markets: List[Dict[str, Any]] = []
+    seen = set()
+    page_size = max(1, min(int(page_size), 100))
+    offset = 0
+
+    while len(markets) < limit:
+        batch_limit = min(page_size, limit - len(markets))
+        req = urllib.request.Request(
+            GAMMA_MARKETS_URL.format(limit=batch_limit, offset=offset),
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                page = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            if not markets:
+                raise
+            break
+
+        if not isinstance(page, list) or not page:
+            break
+        for m in page:
+            key = m.get("id") or m.get("slug")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            markets.append(m)
+        if len(page) < batch_limit:
+            break
+        offset += len(page)
+
+    return markets
 
 
 def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
@@ -314,17 +347,79 @@ def scan_liquidity_rewards(
     return results
 
 
+def parse_fee_schedule(market: Dict[str, Any]) -> Dict[str, Any]:
+    """Извлекает расписание комиссий Polymarket из объекта рынка Gamma API."""
+    if not market or not market.get("feesEnabled"):
+        return {
+            "enabled": False,
+            "rate": 0.0,
+            "exponent": 1,
+            "taker_only": True,
+            "unknown": False,
+        }
+    sched = market.get("feeSchedule")
+    if isinstance(sched, str):
+        try:
+            sched = json.loads(sched)
+        except Exception:
+            sched = None
+    if isinstance(sched, dict):
+        try:
+            rate = float(sched.get("rate", 0.0))
+            exponent = float(sched.get("exponent", 1))
+            taker_only = bool(sched.get("takerOnly", sched.get("taker_only", True)))
+            if math.isfinite(rate) and rate > 0 and math.isfinite(exponent) and exponent > 0:
+                return {
+                    "enabled": True,
+                    "rate": rate,
+                    "exponent": int(exponent) if exponent == int(exponent) else exponent,
+                    "taker_only": taker_only,
+                    "unknown": False,
+                }
+        except (TypeError, ValueError):
+            pass
+    # feesEnabled=True, но расписание отсутствует/невалидно — помечаем как unknown (fail-closed)
+    return {
+        "enabled": True,
+        "rate": 0.05,
+        "exponent": 1,
+        "taker_only": True,
+        "unknown": True,
+    }
+
+
+def estimate_taker_fee_usd(
+    shares: float, price: float, fee_schedule: Optional[Dict[str, Any]]
+) -> float:
+    """Оценивает тейкерскую комиссию Polymarket в USD: C * rate * (p * (1 - p))^exponent."""
+    if not fee_schedule or not fee_schedule.get("enabled"):
+        return 0.0
+    if shares <= 0 or not (0.0 < price < 1.0):
+        return 0.0
+    try:
+        rate = float(fee_schedule.get("rate", 0.0))
+        exponent = float(fee_schedule.get("exponent", 1))
+    except (TypeError, ValueError):
+        return 0.0
+    if rate <= 0 or not math.isfinite(rate) or not math.isfinite(exponent):
+        return 0.0
+    fee = shares * rate * ((price * (1.0 - price)) ** exponent)
+    if not math.isfinite(fee) or fee < 0.00001:
+        return 0.0
+    return round(fee, 5)
+
+
 def scan_smart_bonding(
     markets: List[Dict[str, Any]],
     deposit_usd: float = 1000.0,
 ) -> List[Dict[str, Any]]:
-    """Находит рынки с высокой вероятностью исхода (96.5¢ - 99.4¢) для стратегии ИИ-бондинга."""
+    """Находит рынки с высокой вероятностью исхода (94.5¢ - 98.5¢, ≤ 45 дн.) для стратегии ИИ-бондинга."""
     now = datetime.now(timezone.utc)
     candidates: List[Dict[str, Any]] = []
 
     for m in markets:
         risk_info = classify_polymarket_risk(m)
-        if risk_info["is_sports"]:
+        if risk_info["is_sports"] or risk_info.get("is_crypto_price_target"):
             continue
 
         book_liq = float(m.get("liquidityClob") or m.get("liquidity") or 0.0)
@@ -339,28 +434,34 @@ def scan_smart_bonding(
         lead_price = prices[best_idx]
         lead_outcome = outcomes[best_idx] if best_idx < len(outcomes) else "Yes"
 
-        # Ищем цену в диапазоне 0.965 .. 0.994 (запас профита 0.6% .. 3.5% до $1.00)
-        if not (0.965 <= lead_price <= 0.994):
+        # Ищем цену в диапазоне 0.945 .. 0.985 (запас профита 1.5% .. 5.8% до $1.00)
+        if not (0.945 <= lead_price <= 0.985):
             continue
 
         end_str = m.get("endDate") or ""
-        days_left = 14.0
-        if end_str:
-            try:
-                end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                diff_days = (end_dt - now).total_seconds() / 86400.0
-                if diff_days <= 0:
-                    continue
-                days_left = max(1.0, diff_days)
-            except Exception:
-                days_left = 14.0
-
-        if days_left > 30.0:
+        if not isinstance(end_str, str) or not end_str:
             continue
+        try:
+            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        diff_days = (end_dt - now).total_seconds() / 86400.0
+        if diff_days < 0.5 or diff_days > 45.0:
+            continue
+        days_left = max(1.0, diff_days)
 
-        net_return_pct = ((1.0 - lead_price) / lead_price) * 100.0
+        fee_sched = parse_fee_schedule(m)
+        gross_shares = deposit_usd / lead_price
+        est_fee_usd = estimate_taker_fee_usd(gross_shares, lead_price, fee_sched)
+        est_fee_shares = est_fee_usd / lead_price
+        net_shares = max(0.0, gross_shares - est_fee_shares)
+        profit_usd = net_shares * 1.0 - deposit_usd
+        net_return_pct = (profit_usd / deposit_usd) * 100.0 if deposit_usd > 0 else 0.0
+        if net_return_pct <= 0.3:
+            continue
         annualized_apr = net_return_pct * (365.0 / days_left)
-        profit_usd = deposit_usd * (net_return_pct / 100.0)
 
         candidates.append({
             "question": m.get("question", ""),
@@ -374,6 +475,10 @@ def scan_smart_bonding(
             "book_liquidity_usd": book_liq,
             "end_date": end_str,
             "risk": risk_info,
+            "fees_enabled": bool(fee_sched.get("enabled")),
+            "fee_schedule": fee_sched,
+            "estimated_entry_fee_usd": round(est_fee_usd, 4),
+            "estimated_entry_fee_pct": round((est_fee_usd / deposit_usd) * 100.0, 4) if deposit_usd > 0 else 0.0,
             "description": (m.get("description") or "")[:300],
         })
 

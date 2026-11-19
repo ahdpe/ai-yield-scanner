@@ -1,128 +1,115 @@
-# AI Yield Scanner
+# AI Yield Scanner — Live Smart Bonding
 
-A paper-trading research system that looks for yield on **Polymarket** (prediction markets) and **Hyperliquid** (perpetual futures), screens every entry with an LLM risk audit (Venice AI), and simulates a $5,000 USDC portfolio against live market data. A Telegram bot shows the portfolio and sends alerts.
+A real-money **Polymarket Smart Bonding** bot with a two-model LLM risk audit (Venice AI, with Command Code failover). It scans high-probability outcomes, buys them near resolution, and protects open positions with a relative stop-loss. A Telegram bot provides a read-only portfolio view and alerts.
 
-> **Paper trading only.** The system never places orders and holds no wallet or exchange keys. All P&L is simulated from public market data.
+> **LIVE — REAL FUNDS.** This repository now runs a live trading bot. It holds a Polymarket wallet key in `state/live_config.env` on the production host. Never commit `state/`, never print keys or chat IDs, and never start a second copy of the trader or the bot. The old paper-trading system is legacy; see `deploy/legacy-paper/`.
 
-## Strategies
+## Strategy
 
-The portfolio has five $1,000 slots:
+- **Universe:** top-500 active Polymarket markets by 24h volume (Gamma API, paginated).
+- **Entry:** leading outcome **94.5¢–98.5¢**, expiry **0.5–45 days**, liquidity ≥ **$25,000**, book spread ≤ **1.5¢**, fee rate ≤ **0.06**. Sports and crypto price targets are excluded. A market without a valid `endDate` is rejected.
+- **Position:** **10 slots × $100** (strategy limit $1,000). Buy at the best ask, then reconcile confirmed fills and fees against the actual conditional-token balance.
+- **Risk:** relative stop-loss **-3.5¢** from entry (floor $0.85), max **2 open slots per topic cluster**, 12h reopen cooldown, 6h AI re-audit. Two fresh `SKIP` verdicts close a position.
+- **Execution:** `polymarket-client` `SecureClient` (Polymarket Deposit Wallet, `signature_type=3`, pUSD). The intent is persisted before the order is submitted; an ambiguous submission fails closed and requires reconciliation.
 
-| Slots | Strategy | Idea |
-|---|---|---|
-| 1–3 | **Polymarket liquidity rewards** (`poly_mm`) | Quote two-sided limit orders inside the reward spread and collect Polymarket's daily USDC liquidity rewards. |
-| 4 | **Polymarket bonding** (`poly_bond`) | Buy an outcome priced 96.5¢–99.4¢ shortly before resolution and hold it to the $1.00 payout. |
-| 5 | **Hyperliquid funding carry** (`hl_funding`) | Short a perp with persistently positive funding and hedge it with the matching Hyperliquid spot token. |
+### Stop-loss behavior
 
-When a slot closes (resolution, stop-loss, AI rejection, repeated fills, funding reversal), its capital is reallocated to a new candidate automatically.
+A stop-loss SELL is placed at the current best bid (one tick below it for a higher fill probability). If the order is still unfilled after 60 seconds, or if the market has moved so that its limit is above the current best bid, the trader cancels it, waits for the cancellation to be confirmed by reconciliation, and re-quotes at the new best bid. A new SELL is never sent while an old one is still live or unconfirmed.
 
-## How it works
+## AI audit
+
+- Every entry requires **2/2 APPROVE** with confidence ≥ 70 from `claude-sonnet-5-5` + `grok-4-6` (Venice web search enabled). Anything else is `SKIP` (fail-closed).
+- Open positions are re-audited every 6 hours with one model; the first `SKIP` triggers a recheck in 1 hour, and a second fresh `SKIP` closes the position.
+- **Budget:** Venice allows 240 paid calls per UTC day, 96 reserved for re-audits. Command Code is the automatic failover provider with a separate 240/96 budget. If both are unavailable or exhausted, new entries are blocked.
+- Prompt version 3: English prompt, Russian `summary`, market rules capped at 4,000 characters, verdict cache 6h.
+
+## Architecture
 
 ```
-             ┌──────────── every 15 min ─────────────┐   ┌──── every 60 s ────┐
-Gamma API ──►│ scan markets → heuristic risk filter  │   │ CLOB order book    │
-CLOB API  ──►│ → Venice AI audit (2/2 consensus)     │   │ + trade tape       │
-Hyperliquid ►│ → open / re-audit / close slots       │   │ → fills, kill-     │
-             │ → mark bonds, accrue funding          │   │   switch, rewards  │
-             └───────────────┬───────────────────────┘   └─────────┬──────────┘
-                             └───────► state/portfolio_state.json ◄┘
-                                                │
-                                        telegram_bot.py (read-only UI + alerts)
+live_trader.py ──► polymarket_scanner.py (Gamma/CLOB candidate scan)
+      │                 │
+      │                 └─► ai_analyzer.py (Venice AI + Command Code failover)
+      │
+      ├─► live_execution.py (fill/fee reconciliation via SecureClient)
+      ├─► error_alerts.py (recurring-error alerts)
+      └─► state/live_portfolio_state.json (atomic state, fsync before orders)
+
+telegram_bot.py (read-only UI, alerts) ──► state/live_portfolio_state.json
 ```
-
-### Market-making simulation (`poly_mm`)
-
-- **Rewards** use Polymarket's quadratic scoring, `S = ((v − s) / v)² × size`, computed against the live CLOB book (only orders ≥ `rewardsMinSize` count; the min/÷3 rule for one-sided books is applied).
-- **Honest accrual.** Rewards accrue only for windows in which our quotes rested without a fill and the book was healthy. The lower of the start/end APR is used, the APR may at most double per hour, and it is capped at 365%/year. A book emptied by a crash produces a huge formula APR, but that is not income.
-- **Fill detection from the trade tape.** Any trade at or through our bid/ask (including the NO side, converted to YES-equivalent prices) is treated as a fill. The Polymarket Data API shows trades 1.5–4 minutes late, so each check reads the last 15 minutes of trades, deduplicates them, and compares each trade with the quotes that were live at that trade's timestamp (`quote_log`).
-- **After a fill**, the inventory is unwound conservatively at the worse of mid and the crossing trade price, plus half the book spread (≥ 0.8¢/share). Quoting pauses for 3 hours, and a second fill within 24 hours closes the slot.
-- **Kill-switch.** Quotes are re-centred when the mid moves ≥ 1¢ from the price at which they were placed, so slow drift is caught too.
-- **Expiry filter.** MM only opens on markets that expire in ≥ 7 days and is closed when < 2 days remain.
-
-### Bonding (`poly_bond`)
-
-The position is marked to market every tick, and a stop-loss sells it below 95¢. Resolved markets pay $1 or $0 per share.
-
-### Funding carry (`hl_funding`)
-
-Only coins with a liquid Hyperliquid spot hedge (≥ $100k daily volume) and positive funding qualify. Funding accrues on the perp leg (half the slot). The slot closes after two consecutive ticks of adverse funding or on delisting, with fees charged on entry and exit.
-
-### AI risk audit (Venice AI)
-
-- Every entry requires **two independent APPROVE verdicts** with confidence ≥ 70. Anything else is SKIP (fail-closed).
-- The prompt includes the current date, the market rules, and the market's end date, plus a rule to skip markets that depend on elections or other events happening this week.
-- Open Polymarket positions are re-audited every 6 hours; two fresh SKIPs in a row close the position.
-- **Budget control.** There is a hard cap of 40 paid calls per UTC day, of which 16 are reserved for re-audits. Slot refill checks at most one new candidate per strategy per tick, and cached verdicts are reused for free. A typical call costs ~0.003 DIEM.
-- **Emergency mode.** A free `/models` heartbeat runs every tick. Two consecutive failures pause all MM quoting until the connection recovers.
-
-### Error alerts (Telegram)
-
-- **Persistent API failures** (Gamma, CLOB order book, Data API trade tape, Hyperliquid, Venice audits, or missing data for an open position) trigger an alert once they have kept recurring for 20 minutes. One-off errors such as a single 403 stay silent. A reminder follows every 6 hours, and a "recovered" message is sent once the error has stopped for 15 minutes.
-- **Code errors** inside the daemon's or the bot's loop are reported immediately.
-- **Process crashes.** `service_exit_alert.py` runs as the units' `ExecStopPost` hook and reports any non-clean exit with the last journal lines (at most one message per 30 minutes during a crash loop). It uses only the standard library, so it works even when the main code fails to import.
 
 ## Project layout
 
 | File | Purpose |
 |---|---|
-| `paper_trader.py` | Simulation daemon: slots, fills, rewards, refill, re-audits, CLI status |
-| `polymarket_scanner.py` | Gamma/CLOB/Data API access, quadratic reward model, candidate scans |
-| `hyperliquid_scanner.py` | Funding anomaly scan with spot-hedge check |
-| `ai_analyzer.py` | Heuristic risk filter, Venice AI audit, consensus, daily budget, health tracking |
-| `telegram_bot.py` | Interactive Telegram bot (portfolio, AI verdicts, logs, settings) |
+| `live_trader.py` | Live daemon: guard rails, stop-loss, entries, re-audits, state |
+| `live_execution.py` | Fill confirmation, fee calculation, conditional-token balance |
+| `polymarket_scanner.py` | Gamma/CLOB access and Smart Bonding candidate scan |
+| `ai_analyzer.py` | Venice audit, 2/2 consensus, budget, health, Command Code failover |
+| `telegram_bot.py` | Read-only Telegram UI (portfolio, AI verdicts, logs, settings) |
 | `telegram_notifier.py` | Alert delivery with HTML escaping and plain-text fallback |
-| `error_alerts.py` | Tracks recurring errors and sends problem / reminder / recovered alerts |
-| `service_exit_alert.py` | systemd `ExecStopPost` hook that reports service crashes |
+| `error_alerts.py` | Recurring-error tracker (20 min to alert, 6h reminders, recovery) |
+| `service_exit_alert.py` | stdlib-only systemd `ExecStopPost` crash hook |
 | `state_io.py` | Atomic JSON writes and HTML escaping |
-| `run_scanner.py` | One-off market scan in the terminal |
-| `deploy/` | systemd unit templates and configuration examples |
-| `MANUAL.md` | Detailed technical manual (Russian) |
-| `AGENTS.md` | Working rules for coding agents: deployment, state, secrets, experiment rules, API notes |
+| `deploy/` | Live systemd units, config examples, deployment notes |
+| `paper_trader.py`, `hyperliquid_scanner.py`, `run_scanner.py` | Legacy paper/research code; not used by the live service |
 
-The code uses only the Python standard library (3.10+).
+The live service needs `polymarket-client` and `py_clob_client` (see `requirements.txt`); the rest is the Python standard library (3.10+).
 
-## Setup
+## Setup (production VPS)
 
 ```bash
-git clone git@github.com:ahdpe/ai-yield-scanner.git ~/ai_yield_scanner
-cd ~/ai_yield_scanner
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+
 mkdir -p state
-
-# Telegram bot credentials (state/ is git-ignored)
+cp deploy/env.example state/live_config.env
+chmod 600 state/live_config.env                 # fill in wallet + AI keys
 cp deploy/telegram_config.example.json state/telegram_config.json
-chmod 600 state/telegram_config.json      # then fill in the token and your user ID
+chmod 600 state/telegram_config.json            # fill in bot token + admin chat id
 
-# Venice AI key: export it, or put VENICE_API_KEY=... into ~/.hermes/.env
-export VENICE_API_KEY=...                  # see deploy/env.example for all variables
+# Replace __PROJECT_DIR__ in the unit files with the project path.
+cp deploy/ai-yield-live.service deploy/ai-yield-live-bot.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ai-yield-live.service ai-yield-live-bot.service
+systemctl is-active ai-yield-live.service ai-yield-live-bot.service
 ```
 
-Run it manually:
+The units are **system** services (no `--user`). `EnvironmentFile` loads `state/live_config.env`; keep that file mode `600`. See `deploy/README.md` for details.
 
-```bash
-python3 run_scanner.py --deposit 1000        # one-off scan
-python3 paper_trader.py --once               # one simulation tick
-python3 paper_trader.py --status             # portfolio report
-python3 paper_trader.py --reset              # start a fresh portfolio
-```
+## State and secrets
 
-Or run it as systemd user services:
+Everything mutable lives in `state/` (git-ignored, never commit it):
 
-```bash
-cp deploy/ai-yield-*.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ai-yield-paper ai-yield-bot
-loginctl enable-linger "$USER"               # keep running after logout
-```
+| File | Purpose |
+|---|---|
+| `live_portfolio_state.json` | Live portfolio state, positions, PnL, cash snapshot |
+| `live_trader.log` | Event log shown by the bot's `/logs` |
+| `ai_audits_cache.json` | Cached Venice verdicts |
+| `ai_budget.json`, `ai_budget_backup.json` | Paid AI calls used today (UTC) |
+| `ai_health.json` | Venice connectivity and emergency mode |
+| `error_alerts*.json`, `service_exit_alerts.json` | Error-alert trackers |
+| `live_config.env` | Wallet and AI credentials (mode 600) |
+| `telegram_config.json` | Bot token and admin chat id (mode 600) |
+| `live_trader.lock` | Single-instance lock for the trader |
 
-By default `VENICE_BASE_URL` points to a local OpenAI-compatible budget proxy at `127.0.0.1:8787`. To call Venice directly, set it to `https://api.venice.ai/api/v1`.
+Secrets are never stored in git. The repository is public: do not add server IPs, home-directory paths, Telegram IDs, e-mail addresses or keys to code, docs or commit messages.
 
-## Secrets and data
+## Deploying a change
 
-- No credentials are stored in the repository. Telegram credentials live in `state/telegram_config.json`, and the Venice key comes from the environment or `~/.hermes/.env`.
-- `state/` (portfolio, logs, AI cache, budget counters) and all `.env` files are git-ignored.
+1. Run `python3 -m py_compile *.py`.
+2. Run mock tests outside the repo; they must not write to `state/` (compare a checksum before and after).
+3. Back up the changed files and `state/live_portfolio_state.json` on the VPS.
+4. `scp` the changed files, run `venv/bin/python3 -m py_compile *.py` on the VPS.
+5. `systemctl restart ai-yield-live.service` (restart the bot only if its code changed).
+6. Watch the journal for one full tick with no Traceback, then verify `state.available_cash_usd` and open positions.
 
-## Results so far
+Do not run `git pull` on the VPS until the server-side working tree is reconciled with the repository. Do not run `paper_trader.py` on the production host: it is legacy, shares the AI budget, and writes a different state file.
 
-The simulation has been rebuilt several times as modelling flaws were found and fixed: same-day expiry markets, re-quoting into a crash, inflated rewards on empty books, and trade-feed lag hiding fills. The early runs are therefore not comparable.
+## Known limitations
 
-With the current honest fill model, thin "high-APR" markets have so far lost more to fills than they earned in rewards, while calm markets earn small but steady rewards. There is not yet enough history to claim profitability.
+- A stop-loss can gap through its trigger, and a market can have no bid. The re-quote logic keeps retrying, but it cannot guarantee a fill.
+- An ambiguous order submission without an `order_id` still requires manual reconciliation; automatic discovery by account trades is not implemented yet.
+- Resolved positions rely on Polymarket auto-redeem. The bot records `redemption_pending` but does not confirm it or call `redeem_positions()` itself.
+- The Telegram bot is read-only and has no second-instance lock (the trader has `flock`); never run two bots with the same token.
+- There is no committed test suite yet; use throwaway mock tests before every restart.
+- Smart Bonding sells tail risk: a single full loss can exceed many small gains. Profitability is not guaranteed.
