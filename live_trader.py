@@ -1071,6 +1071,14 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
 
                 m = find_market_for_pos(pos, [])
                 pending_exit = any(not x.get("complete") for x in pos.get("exit_orders", []))
+                if pending_exit and (not m or not market_trading_finished(m)):
+                    execute_sell_bond(
+                        secure_client,
+                        pos,
+                        pos.get("close_reason") or "сопровождение незаполненного SELL",
+                        state,
+                    )
+                    continue
                 if m and market_resolved(m) and pos.get("entry_terminal") and not pending_exit:
                     payout = outcome_price(m, pos.get("outcome", "Yes"), float("nan"))
                     if not math.isfinite(payout) or not 0 <= payout <= 1:
