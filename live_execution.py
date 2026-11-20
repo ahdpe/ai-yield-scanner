@@ -38,17 +38,26 @@ def _rows(response: Any) -> list:
         return list(response)
     rows = _field(response, "data")
     if isinstance(rows, (list, tuple)):
+        next_cursor = _field(response, "next_cursor")
+        if _field(response, "has_more", False) or next_cursor not in (None, "", "LTE="):
+            raise ValueError("Список биржи содержит непрочитанные страницы")
         return list(rows)
     # Unified SDK возвращает Paginator, итерация которого дает Page, не Trade.
     if not isinstance(response, (dict, str, bytes)) and hasattr(response, "__iter__"):
         result = []
+        has_more = False
+        received_page = False
         for page in response:
+            received_page = True
             if _field(page, "limit_reached", False):
-                raise ValueError("Список исполнений обрезан лимитом пагинации")
+                raise ValueError("Список биржи обрезан лимитом пагинации")
             items = _field(page, "items")
             if not isinstance(items, (list, tuple)):
                 raise ValueError("Неизвестный формат страницы исполнений")
             result.extend(items)
+            has_more = bool(_field(page, "has_more", False))
+        if not received_page or has_more:
+            raise ValueError("Не получен полный список биржи")
         return result
     raise ValueError("Биржа вернула неизвестный формат списка исполнений")
 
@@ -77,7 +86,7 @@ def calculate_taker_fee_usd(
     return raw.quantize(_MIN_FEE_USD, rounding=ROUND_HALF_UP)
 
 
-def read_conditional_balance(client: Any, token_id: str) -> Decimal:
+def read_conditional_balance(client: Any, token_id: str, *, require_both: bool = False) -> Decimal:
     """Читает фактический чистый остаток условного токена на кошельке (V1 + V2)."""
     if not token_id:
         raise ValueError("Не указан token_id для проверки остатка токена")
@@ -87,19 +96,48 @@ def read_conditional_balance(client: Any, token_id: str) -> Decimal:
     for asset_type in ("CONDITIONAL", "CONDITIONAL-V2"):
         try:
             resp = client.get_balance_allowance(asset_type=asset_type, token_id=token_id)
-            raw_bal = _field(resp, "balance", 0)
+            raw_bal = _field(resp, "balance", None if require_both else 0)
             total += _number(raw_bal) / _TOKEN_SCALE
             succeeded += 1
         except Exception as exc:
             last_err = exc
-    if succeeded == 0:
+    if succeeded < (2 if require_both else 1):
         raise ValueError("Не удалось получить фактический остаток токена на кошельке") from last_err
     return total
 
 
+def _sdk_received_null(error: Exception) -> bool:
+    """Отличает JSON null от сетевой ошибки и несовместимой схемы SDK."""
+    if (type(error).__module__, type(error).__name__) != ("polymarket.errors", "UnexpectedResponseError"):
+        return False
+    errors = getattr(error.__cause__, "errors", None)
+    if not callable(errors):
+        return False
+    details = errors()
+    return (isinstance(details, list) and len(details) == 1 and isinstance(details[0], dict)
+            and details[0].get("type") == "model_type" and details[0].get("loc") == ()
+            and "input" in details[0] and details[0]["input"] is None)
+
+
+def _check_open_order_absence(client: Any, market: str, order_id: str, token_id: str) -> bool:
+    """Проверяет оба полных списка и возвращает наличие других заявок того же токена."""
+    other_token_order = False
+    for list_orders in (client.list_open_orders, client.list_wallet_open_orders):
+        for order in _rows(list_orders(market=market)):
+            found_id = _text(_field(order, "id"))
+            asset = _text(_field(order, "asset_id"))
+            if not found_id or not asset:
+                raise ValueError("Не удалось сверить идентификатор открытого ордера")
+            if found_id == order_id:
+                raise ValueError("Заявка всё ещё числится открытой по данным биржи")
+            other_token_order |= asset == token_id
+    return other_token_order
+
+
 def read_execution(client: Any, order_id: str, token_id: str, side: str,
                    expected_size: float, *, market: str = "",
-                   fee_schedule: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                   fee_schedule: Optional[Dict[str, Any]] = None,
+                   probe_missing_partial: bool = False) -> Dict[str, Any]:
     """Возвращает подтвержденное исполнение; при сомнениях бросает исключение.
 
     complete означает, что заявка терминальна и все исполненные акции имеют
@@ -112,12 +150,15 @@ def read_execution(client: Any, order_id: str, token_id: str, side: str,
         raise ValueError("Недостаточно данных для сверки ордера")
 
     order_error = None
+    order_is_null = False
     try:
         order = client.get_order(order_id=order_id)
+        if order is None:
+            order_is_null = True
+            order_error = ValueError("Биржа вернула пустую запись ордера")
     except Exception as exc:
-        # Endpoint открытых ордеров может не возвращать уже исполненный ордер.
-        # Только полный подтвержденный объем ниже заменяет отсутствующий снимок.
         order_error = exc
+        order_is_null = _sdk_received_null(exc)
     if order_error is None:
         actual_id = _field(order, "id", _field(order, "order_id"))
         if (_text(actual_id) != order_id
@@ -146,17 +187,21 @@ def read_execution(client: Any, order_id: str, token_id: str, side: str,
     total_fee_shares = Decimal(0)
     seen = set()
     confirmed_market = market
+    unsettled_trades = False
     taker_only = True
     if isinstance(fee_schedule, dict):
         taker_only = bool(fee_schedule.get("taker_only", fee_schedule.get("takerOnly", True)))
     for trade in _rows(trades):
-        if _text(_field(trade, "status")).upper() != "CONFIRMED":
-            continue
-        taker_match = (_text(_field(trade, "taker_order_id")) == order_id
-                       and _text(_field(trade, "trader_side")).upper() == "TAKER")
+        same_taker_id = _text(_field(trade, "taker_order_id")) == order_id
+        taker_match = same_taker_id and _text(_field(trade, "trader_side")).upper() == "TAKER"
+        if same_taker_id and not taker_match:
+            unsettled_trades = True
         maker_matches = [m for m in (_field(trade, "maker_orders", []) or [])
                          if _text(_field(m, "order_id")) == order_id]
         if not taker_match and not maker_matches:
+            continue
+        if _text(_field(trade, "status")).upper() != "CONFIRMED":
+            unsettled_trades = True
             continue
         trade_market = _text(_field(trade, "condition_id") or _field(trade, "market"))
         if confirmed_market and trade_market and trade_market != confirmed_market:
@@ -195,20 +240,30 @@ def read_execution(client: Any, order_id: str, token_id: str, side: str,
             confirmed += quantity
             cash += quantity * price
     if order_error is not None:
-        if abs(confirmed - expected) > _EPS:
+        if abs(confirmed - expected) <= _EPS:
+            status = "CONFIRMED"
+        elif (probe_missing_partial and order_is_null and side == "BUY" and market
+              and 0 < confirmed < expected - _EPS and not unsettled_trades):
+            other_token_order = _check_open_order_absence(client, market, order_id, token_id)
+            return {
+                "status": "MISSING_PARTIAL",
+                "matched_shares": float(confirmed),
+                "confirmed_shares": float(confirmed),
+                "confirmed_cash": float(cash),
+                "has_fee": has_fee,
+                "estimated_fee_usd": float(total_fee_usd),
+                "estimated_fee_shares": float(total_fee_shares),
+                "condition_id": confirmed_market,
+                "terminal": False, "settled": False, "complete": False,
+                "missing_partial": True,
+                "other_token_order": other_token_order,
+            }
+        else:
             raise ValueError("Без снимка ордера не подтвержден весь запрошенный объем") from order_error
-        return {
-            "status": "CONFIRMED", "matched_shares": float(confirmed),
-            "confirmed_shares": float(confirmed), "confirmed_cash": float(cash),
-            "has_fee": has_fee,
-            "estimated_fee_usd": float(total_fee_usd),
-            "estimated_fee_shares": float(total_fee_shares),
-            "terminal": True, "settled": True, "complete": True,
-            "condition_id": confirmed_market,
-        }
+        matched = confirmed
     if confirmed > matched + _EPS:
         raise ValueError("Список сделок опережает снимок ордера; нужна повторная сверка")
-    terminal = status in _TERMINAL
+    terminal = status in _TERMINAL or status == "CONFIRMED"
     return {
         "status": status,
         "matched_shares": float(matched),

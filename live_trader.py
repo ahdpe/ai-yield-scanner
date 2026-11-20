@@ -26,6 +26,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from polymarket import SecureClient
+from polymarket.errors import RequestRejectedError
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
 
@@ -88,8 +89,12 @@ ENTRY_AUDIT_CACHE_TTL_SEC = 21600.0  # 6 часов кэша для аудито
 REAUDIT_INTERVAL_SEC = 21600.0    # 6 часов между плановыми реаудитами
 REAUDIT_RECHECK_SEC = 3600.0      # Перепроверка через час после первого SKIP
 REOPEN_COOLDOWN_SEC = 12 * 3600.0 # Пауза перед повторным входом в закрытый рынок
+MISSING_BUY_CONFIRM_SEC = 90.0    # Две сверки исчезнувшей заявки в разных циклах
+MISSING_BUY_MAX_GAP_SEC = 360.0
 SELL_REPLACE_AFTER_SEC = 60.0     # Незаполненный Stop-Loss SELL перевыставляем через минуту
 SELL_AGGRESSIVE_TICKS = 1         # На сколько тиков ниже best_bid ставить SELL для выкупа
+REAUDIT_EXIT_MIN_CONFIDENCE = 75  # Досрочный выход по реаудиту только при явном SKIP с уверенностью >= 75%
+FAST_GUARD_INTERVAL_SEC = 20      # Быстрая проверка стаканов и Stop-Loss открытых позиций каждые 20 с
 
 TOPIC_CLUSTER_PATTERNS = {
     "iran_mideast": re.compile(
@@ -526,6 +531,61 @@ def _resolve_pos_fee_schedule(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _confirm_missing_buy(client: SecureClient, state: Dict[str, Any], pos: Dict[str, Any],
+                         entry: Dict[str, Any]) -> bool:
+    """Признаёт остаток неактивным после двух совпадающих сверок исполнений и кошелька."""
+    snapshot = {
+        "version": 1,
+        "order_id": pos["order_id"],
+        "token_id": pos["token_id"],
+        "condition_id": pos["condition_id"],
+        "requested_shares": float(pos.get("requested_shares", pos["shares"])),
+        "confirmed_shares": entry["confirmed_shares"],
+        "confirmed_cash": entry["confirmed_cash"],
+        "estimated_fee_shares": entry.get("estimated_fee_shares", 0.0),
+    }
+    recovered = pos.get("missing_buy_recovery") or {}
+    if recovered.get("snapshot") == snapshot:
+        return True
+    if pos.get("exit_orders") or entry.get("other_token_order"):
+        raise ValueError("Нельзя восстановить BUY при других заявках по тому же активу")
+    if any(p is not pos and p.get("status") == "OPEN" and p.get("token_id") == pos["token_id"]
+           for p in state["positions"]):
+        raise ValueError("Нельзя однозначно сопоставить баланс нескольким позициям по активу")
+
+    gross = Decimal(str(entry["confirmed_shares"]))
+    expected_net = gross - Decimal(str(snapshot["estimated_fee_shares"]))
+    previous_gross = Decimal(str(pos.get("confirmed_bought_shares") or 0))
+    if gross < previous_gross - Decimal("0.000001"):
+        raise ValueError("Подтверждённый объём исчезнувшей заявки уменьшился")
+    if entry.get("has_fee") and gross == previous_gross and pos.get("confirmed_net_bought_shares") is not None:
+        expected_net = Decimal(str(pos["confirmed_net_bought_shares"]))
+    balance = read_conditional_balance(client, pos["token_id"], require_both=True)
+    if expected_net <= 0 or abs(balance - expected_net) > Decimal("0.000001"):
+        raise ValueError("Остаток кошелька не совпадает с исполнением исчезнувшей заявки")
+
+    observation = {**snapshot, "wallet_shares": str(balance.normalize())}
+    now = time.time()
+    previous = pos.get("missing_buy_observation") or {}
+    elapsed = now - float(previous.get("at") or 0)
+    if previous.get("snapshot") != observation or not 0 <= elapsed <= MISSING_BUY_MAX_GAP_SEC:
+        pos["missing_buy_observation"] = {"at": now, "snapshot": observation}
+        pos["reconciliation_pending"] = True
+        save_live_state(state)
+        log_live_event(f"⏳ Заявка отсутствует в списках биржи, ждём повторную сверку: {pos['title'][:45]}.")
+        return False
+    if elapsed < MISSING_BUY_CONFIRM_SEC:
+        return False
+
+    pos["missing_buy_recovery"] = {"at": now, "snapshot": snapshot, "wallet_shares": observation["wallet_shares"]}
+    pos.pop("missing_buy_observation", None)
+    log_live_event(
+        f"✅ Сверка BUY восстановлена: {pos['title'][:45]}, "
+        f"подтверждено {gross} акций, неисполненный остаток заявки отсутствует на бирже."
+    )
+    return True
+
+
 def reconcile_position(client: SecureClient, state: Dict[str, Any], pos: Dict[str, Any]) -> bool:
     """Только подтверждённые исполнения меняют количество, стоимость и PnL.
 
@@ -543,10 +603,14 @@ def reconcile_position(client: SecureClient, state: Dict[str, Any], pos: Dict[st
 
         def _read_with_schedule(order_id: str, side: str, exp_size: float, market_id: str) -> Dict[str, Any]:
             nonlocal fee_sched
+            probe_missing = side == "BUY" and bool(
+                pos.get("execution_checked_at") and pos.get("entry_settled") and market_id
+            )
             try:
                 return read_execution(
                     client, order_id, pos["token_id"], side, exp_size,
                     market=market_id, fee_schedule=fee_sched,
+                    probe_missing_partial=probe_missing,
                 )
             except ValueError as err:
                 if "fee_schedule" in str(err):
@@ -556,10 +620,19 @@ def reconcile_position(client: SecureClient, state: Dict[str, Any], pos: Dict[st
                         return read_execution(
                             client, order_id, pos["token_id"], side, exp_size,
                             market=market_id, fee_schedule=fee_sched,
+                            probe_missing_partial=probe_missing,
                         )
                 raise
 
         entry = _read_with_schedule(pos["order_id"], "BUY", requested, pos.get("condition_id") or "")
+        if entry.get("missing_partial"):
+            if not _confirm_missing_buy(client, state, pos, entry):
+                return False
+            entry.update(status="RECOVERED_PARTIAL", terminal=True, settled=True, complete=True)
+        else:
+            pos.pop("missing_buy_observation", None)
+            if not entry["terminal"]:
+                pos.pop("missing_buy_recovery", None)
         condition_id = entry.get("condition_id") or pos.get("condition_id") or ""
         exits = []
         for order in pos.get("exit_orders", []):
@@ -671,6 +744,7 @@ def reconcile_position(client: SecureClient, state: Dict[str, Any], pos: Dict[st
         return settled
     except Exception as exc:
         pos["reconciliation_pending"] = True
+        pos.pop("missing_buy_observation", None)
         detail = " ".join(str(exc).split())[:240]
         log_live_event(
             f"⚠️ Сверка исполнения {pos.get('title', '')[:45]} недоступна: "
@@ -716,6 +790,28 @@ def entry_fee_allowed(market: Optional[Dict[str, Any]], token_id: str) -> Tuple[
         return False, {}, f"высокая ставка комиссии rate={rate:.2f} > {MAX_ENTRY_FEE_RATE:.2f}"
     sched["base_fee_bps"] = int(base_fee)
     return True, sched, f"rate={rate:.2f}"
+
+
+def _buy_rejection_reason(error: Exception) -> Optional[str]:
+    """Признаёт только явный отказ площадки; дубли и сбои транспорта требуют сверки."""
+    if not isinstance(error, RequestRejectedError):
+        return None
+    if error.status == 503 and error.code == "post_only_mode":
+        return "post_only_mode"
+    if error.status != 400:
+        return None
+    known = {
+        "not_enough_balance": "not enough balance / allowance",
+        "invalid_expiration": "invalid expiration",
+        "market_not_ready": "the market is not yet ready to process new orders",
+        "post_only_would_cross": "invalid post-only order: order crosses book",
+    }
+    if error.code:
+        return error.code if error.code in known else None
+    message = str(error).strip().lower()
+    if message.startswith("not enough balance / allowance:"):
+        return "not_enough_balance"
+    return next((reason for reason, text in known.items() if message == text), None)
 
 
 def execute_buy_bond(secure_client: SecureClient, candidate: Dict[str, Any], slot_size: float,
@@ -792,9 +888,25 @@ def execute_buy_bond(secure_client: SecureClient, candidate: Dict[str, Any], slo
         pos.update(order_id=order_id, order_status=status, execution_unknown=False)
         save_live_state(state)
     except Exception as exc:
+        rejection = _buy_rejection_reason(exc)
+        if rejection and not pos.get("order_id"):
+            pos.update(status="REJECTED", closed_at=time.time(), order_status="REJECTED",
+                       execution_unknown=False, reconciliation_pending=False, rejection_reason=rejection)
+            save_live_state(state)
+            log_live_event(f"⚠️ Биржа явно отклонила BUY: HTTP {exc.status}, {rejection}; слот свободен.")
+            notify_live(f"⚠️ <b>[LIVE] Покупка отклонена</b>\n{format_market_link(pos['title'], pos['slug'])}\n"
+                        f"Причина: <code>{esc(rejection)}</code>.")
+            return None
         pos.update(status="OPEN", execution_unknown=True)
+        detail = type(exc).__name__
+        if isinstance(exc, RequestRejectedError):
+            safe_code = exc.code if isinstance(exc.code, str) and re.fullmatch(r"[a-z_]{1,40}", exc.code) else None
+            detail += f", HTTP {exc.status}" + (f", код {safe_code}" if safe_code else "")
+            pos["submit_http_status"] = exc.status
+            if safe_code:
+                pos["submit_error_code"] = safe_code
         save_live_state(state)
-        log_live_event(f"🚨 Результат BUY неизвестен: {type(exc).__name__}; повтор заблокирован.")
+        log_live_event(f"🚨 Результат BUY неизвестен: {detail}; повтор заблокирован.")
         notify_live("🚨 <b>[LIVE] Результат покупки требует сверки.</b> Повторные входы заблокированы; действующие позиции сопровождаются.")
         return pos
     reconcile_position(secure_client, state, pos)
@@ -1100,13 +1212,23 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                     audit = call_venice_market_audit(
                         question=pos.get("question") or pos["title"].split(" [")[0],
                         description=m.get("description", ""), price_yes=float(pos.get("current_price", entry_price)),
-                        strategy_type="polymarket_smart_bonding", outcome_label=pos.get("outcome", "Yes"),
+                        strategy_type="polymarket_smart_bonding_reaudit", outcome_label=pos.get("outcome", "Yes"),
                         cache_ttl_sec=interval, end_date=m.get("endDate", ""))
                     audited_at = float(audit.get("audited_at") or 0)
                     if audited_at and audited_at != float(pos.get("last_audit_ts", 0)):
-                        pos.update(last_audit_ts=audited_at, ai_audit=audit,
-                                   ai_skip_streak=0 if audit.get("decision") == "APPROVE" else streak + 1)
+                        raw_dec = str(audit.get("raw_decision") or audit.get("decision") or "").upper()
+                        conf = int(audit.get("confidence") or 0)
+                        is_hard_exit_skip = (raw_dec == "SKIP" and conf >= REAUDIT_EXIT_MIN_CONFIDENCE)
+                        pos.update(
+                            last_audit_ts=audited_at,
+                            ai_audit=audit,
+                            ai_skip_streak=streak + 1 if is_hard_exit_skip else 0,
+                        )
                         save_live_state(state)
+                        if is_hard_exit_skip:
+                            log_live_event(
+                                f"⚠️ Реаудит [{pos['title'][:42]}]: SKIP ({conf}%, страйк {pos['ai_skip_streak']}/2) — {audit.get('summary')}"
+                            )
                         if pos["ai_skip_streak"] >= 2:
                             execute_sell_bond(secure_client, pos, f"ИИ дважды вернул SKIP: {audit.get('summary')}", state)
             except Exception as exc:
@@ -1289,6 +1411,100 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
         secure_client.close()
 
 
+def run_fast_stop_guard(cfg: Dict[str, str]) -> None:
+    """Быстрая проверка стаканов и Stop-Loss открытых позиций (каждые 20 с) без скана Gamma и без вызовов ИИ."""
+    total_deposit = float(cfg.get("LIVE_TOTAL_DEPOSIT", str(DEFAULT_TOTAL_DEPOSIT)))
+    state = load_live_state(deposit=total_deposit)
+    open_positions = [p for p in state.get("positions", []) if p.get("status") == "OPEN"]
+    if not open_positions:
+        return
+
+    now = time.time()
+    secure_client: Optional[SecureClient] = None
+    state_changed = False
+
+    def _client() -> SecureClient:
+        nonlocal secure_client
+        if secure_client is None:
+            secure_client = init_secure_client(cfg)
+        return secure_client
+
+    try:
+        for pos in open_positions:
+            try:
+                stop_px = pos_stop_loss_price(pos)
+                pending_exit = any(not x.get("complete") for x in pos.get("exit_orders", []))
+                needs_sync = (
+                    not pos.get("entry_terminal")
+                    or pending_exit
+                    or pos.get("reconciliation_pending")
+                    or pos.get("execution_unknown")
+                )
+                if needs_sync:
+                    state_changed = True
+                    if not reconcile_position(_client(), state, pos):
+                        book = _parse_book_summary(_safe_fetch_book(pos["token_id"]))
+                        crossed = book and book["best_bid"] is not None and book["best_bid"] < stop_px
+                        if (crossed or pos.get("execution_unknown")) and now - float(pos.get("last_sync_alert_at", 0)) >= 1800:
+                            pos["last_sync_alert_at"] = now
+                            save_live_state(state)
+                            notify_live(
+                                f"🚨 <b>[LIVE] Требуется проверка исполнения</b>\n"
+                                f"{format_market_link(pos['title'], pos.get('slug', ''))}\n"
+                                "Автоматическая повторная заявка заблокирована до сверки. "
+                                + (f"Цена ниже стопа ${stop_px:.4f}!" if crossed else "Результат отправки ордера неизвестен.")
+                            )
+                        continue
+                    if pos.get("status") != "OPEN":
+                        continue
+                    stop_px = pos_stop_loss_price(pos)
+                    pending_exit = any(not x.get("complete") for x in pos.get("exit_orders", []))
+
+                shares = float(pos.get("shares") or 0.0)
+                entry_price = float(pos.get("entry_price") or 0.0)
+                summary = _parse_book_summary(_safe_fetch_book(pos["token_id"]))
+                if summary and summary["best_bid"] is not None:
+                    bid = float(summary["best_bid"])
+                    ask = float(summary["best_ask"]) if summary["best_ask"] is not None else bid
+                    new_cur = round((bid + ask) / 2, 4)
+                    new_upnl = round(shares * (new_cur - entry_price), 6)
+                    if pos.get("current_price") != new_cur or pos.get("unrealized_pnl_usd") != new_upnl:
+                        pos["current_price"] = new_cur
+                        pos["unrealized_pnl_usd"] = new_upnl
+                        state_changed = True
+                    if bid < stop_px:
+                        finished = find_market_for_pos(pos, [])
+                        if not finished or not market_trading_finished(finished):
+                            execute_sell_bond(
+                                _client(),
+                                pos,
+                                f"лучший bid ${bid:.4f} ниже стопа ${stop_px:.4f} (-3.5¢)",
+                                state,
+                            )
+                            state_changed = True
+                            continue
+
+                if pending_exit:
+                    m = find_market_for_pos(pos, [])
+                    if not m or not market_trading_finished(m):
+                        execute_sell_bond(
+                            _client(),
+                            pos,
+                            pos.get("close_reason") or "сопровождение незаполненного SELL",
+                            state,
+                        )
+                        state_changed = True
+            except Exception as exc:
+                log_live_event(
+                    f"⚠️ Ошибка быстрой проверки {pos.get('title', '')[:40]}: {type(exc).__name__}"
+                )
+        if state_changed:
+            save_live_state(state)
+    finally:
+        if secure_client is not None:
+            secure_client.close()
+
+
 def print_status(cfg: Dict[str, str]) -> None:
     """Выводит сводку состояния портфеля в терминал."""
     state = load_live_state()
@@ -1396,10 +1612,19 @@ def main() -> None:
 
         elapsed = time.time() - t0
         sleep_time = max(5.0, args.interval - elapsed)
-        for _ in range(int(sleep_time)):
+        waited = 0
+        next_fast_guard = FAST_GUARD_INTERVAL_SEC
+        while running and waited < int(sleep_time):
+            time.sleep(1)
+            waited += 1
             if not running:
                 break
-            time.sleep(1)
+            if waited >= next_fast_guard and (int(sleep_time) - waited) >= 5:
+                try:
+                    run_fast_stop_guard(cfg)
+                except Exception as exc:
+                    log_live_event(f"⚠️ Ошибка в быстром цикле Stop-Loss: {type(exc).__name__}: {exc}")
+                next_fast_guard += FAST_GUARD_INTERVAL_SEC
 
 
 if __name__ == "__main__":

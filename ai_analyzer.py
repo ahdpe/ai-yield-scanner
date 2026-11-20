@@ -543,6 +543,28 @@ def _build_audit_prompt(
             '"summary": "краткое обоснование на русском (1-2 предложения)", '
             '"watch_keywords": ["keyword1", "keyword2"]}'
         )
+    if strategy_type == "polymarket_smart_bonding_reaudit":
+        stop_price = max(0.01, price_yes - SMART_BONDING_STOP_OFFSET)
+        return (
+            f"Market: {question}\n"
+            f"Date (UTC): {today} | Expiry: {end_line_en}\n"
+            f"Existing position: HOLD [{outcome_label}] (current price ${price_yes:.4f}; "
+            f"protected by automatic Stop-Loss at ${stop_price:.4f}, -3.5c below entry).\n\n"
+            "Role: Quantitative risk manager monitoring an ALREADY OPEN Polymarket Smart Bonding position. "
+            "Entry spread and fees are already paid; exiting early incurs bid-ask spread and taker fee losses.\n"
+            f"Use live web search to verify current facts and breaking news as of {today}.\n\n"
+            "Decision criteria:\n"
+            f"- APPROVE (confidence >= 70) to KEEP HOLDING if there is no new credible threat against [{outcome_label}]. "
+            "Absence of new news, routine noise, or modest remaining upside is a reason to KEEP HOLDING (APPROVE with confidence >= 75), NOT to exit.\n"
+            "- SKIP (confidence >= 75) ONLY if there is a concrete, high-conviction reason to EXIT EARLY right now:\n"
+            f"  1. New breaking news or confirmed escalation directly threatens [{outcome_label}] and materially increases the chance it resolves against us.\n"
+            f"  2. A newly confirmed imminent binary event creates an unacceptable gap risk straight past Stop-Loss ${stop_price:.4f}.\n\n"
+            f"Resolution rules:\n{description[:4000]}\n\n"
+            'Respond STRICTLY in valid JSON with NO markdown fences (write "summary" in Russian, 1-2 concise sentences):\n'
+            '{"decision": "APPROVE" or "SKIP", "confidence": 0_to_100, '
+            '"summary": "краткое обоснование на русском (1-2 предложения)", '
+            '"watch_keywords": ["keyword1", "keyword2"]}'
+        )
 
     brief = STRATEGY_BRIEFS.get(strategy_type, f"Стратегия: {strategy_type}.").format(
         outcome=outcome_label, price=price_yes, upside_pct=upside_pct
@@ -654,7 +676,8 @@ def _parse_audit_response(
         raise ValueError(f"No JSON found in: {raw_text[:80]}")
     parsed = json.loads(match.group(0))
 
-    decision = str(parsed.get("decision", "")).strip().upper()
+    raw_decision = str(parsed.get("decision", "")).strip().upper()
+    decision = raw_decision
     try:
         confidence = max(0, min(100, int(parsed.get("confidence", 0))))
     except (TypeError, ValueError):
@@ -663,6 +686,7 @@ def _parse_audit_response(
         decision = "SKIP"
     return {
         "decision": decision,
+        "raw_decision": raw_decision,
         "confidence": confidence,
         "summary": str(parsed.get("summary", "")),
         "watch_keywords": parsed.get("watch_keywords", []) if isinstance(parsed.get("watch_keywords"), list) else [],
@@ -987,6 +1011,7 @@ def call_venice_market_audit(
     unique_providers = list(dict.fromkeys(v.get("provider", "venice") for v in votes))
     result = {
         "decision": "SKIP" if skip_vote else "APPROVE",
+        "raw_decision": chosen.get("raw_decision", "SKIP" if skip_vote else "APPROVE"),
         "confidence": chosen["confidence"],
         "summary": chosen["summary"],
         "watch_keywords": chosen["watch_keywords"],
