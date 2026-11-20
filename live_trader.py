@@ -1213,7 +1213,7 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                         question=pos.get("question") or pos["title"].split(" [")[0],
                         description=m.get("description", ""), price_yes=float(pos.get("current_price", entry_price)),
                         strategy_type="polymarket_smart_bonding_reaudit", outcome_label=pos.get("outcome", "Yes"),
-                        cache_ttl_sec=interval, end_date=m.get("endDate", ""))
+                        cache_ttl_sec=interval, end_date=m.get("endDate", ""), stop_loss_price=stop_px)
                     audited_at = float(audit.get("audited_at") or 0)
                     if audited_at and audited_at != float(pos.get("last_audit_ts", 0)):
                         raw_dec = str(audit.get("raw_decision") or audit.get("decision") or "").upper()

@@ -497,7 +497,13 @@ STRATEGY_BRIEFS = {
 
 
 def _build_audit_prompt(
-    question: str, description: str, price_yes: float, strategy_type: str, outcome_label: str, end_date: str = ""
+    question: str,
+    description: str,
+    price_yes: float,
+    strategy_type: str,
+    outcome_label: str,
+    end_date: str = "",
+    stop_loss_price: float = 0.0,
 ) -> str:
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
@@ -519,7 +525,7 @@ def _build_audit_prompt(
 
     upside_pct = ((1.0 - price_yes) / price_yes) * 100.0 if 0.0 < price_yes < 1.0 else 0.0
     if strategy_type == "polymarket_smart_bonding":
-        stop_price = max(0.01, price_yes - SMART_BONDING_STOP_OFFSET)
+        stop_price = stop_loss_price if stop_loss_price > 0 else max(0.01, price_yes - SMART_BONDING_STOP_OFFSET)
         return (
             f"Market: {question}\n"
             f"Date (UTC): {today} | Expiry: {end_line_en}\n"
@@ -544,7 +550,7 @@ def _build_audit_prompt(
             '"watch_keywords": ["keyword1", "keyword2"]}'
         )
     if strategy_type == "polymarket_smart_bonding_reaudit":
-        stop_price = max(0.01, price_yes - SMART_BONDING_STOP_OFFSET)
+        stop_price = stop_loss_price if stop_loss_price > 0 else max(0.01, price_yes - SMART_BONDING_STOP_OFFSET)
         return (
             f"Market: {question}\n"
             f"Date (UTC): {today} | Expiry: {end_line_en}\n"
@@ -809,6 +815,7 @@ def call_venice_market_audit(
     cache_ttl_sec: float = 10800,
     budget_reserve: int = 0,
     end_date: str = "",
+    stop_loss_price: float = 0.0,
 ) -> Dict[str, Any]:
     """Вызывает Venice AI (с автоматическим failover на резервный Command Code) для аудита рынка.
 
@@ -861,7 +868,9 @@ def call_venice_market_audit(
 
     base_url = os.environ.get("VENICE_BASE_URL", "http://127.0.0.1:8787/api/v1")
     backup_base_url = os.environ.get("COMMANDCODE_BASE_URL", DEFAULT_COMMANDCODE_BASE_URL)
-    prompt = _build_audit_prompt(question, description, price_yes, strategy_type, outcome_label, end_date)
+    prompt = _build_audit_prompt(
+        question, description, price_yes, strategy_type, outcome_label, end_date, stop_loss_price=stop_loss_price
+    )
     backup_prompt: str = ""
 
     votes: List[Dict[str, Any]] = []
