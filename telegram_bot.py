@@ -6,7 +6,7 @@ import sys
 import time
 import traceback
 import urllib.parse
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from state_io import STATE_DIR, esc
 
@@ -31,13 +31,22 @@ _LIVE_CFG = _load_live_env()
 
 from ai_analyzer import get_ai_budget, get_ai_health, get_backup_ai_budget, get_venice_models, ping_venice_ai  # noqa: E402
 from error_alerts import bot_alerts  # noqa: E402
-from telegram_notifier import load_tg_config, tg_api_call, tg_send_message  # noqa: E402
+from telegram_notifier import load_tg_config, tg_api_call, tg_edit_message, tg_send_message  # noqa: E402
 
 
 STATE_FILE = STATE_DIR / "live_portfolio_state.json"
 LOG_FILE = STATE_DIR / "live_trader.log"
 AI_CACHE_FILE = STATE_DIR / "ai_audits_cache.json"
 TG_SAFE_HTML_LEN = 3800
+PORTFOLIO_PAGE_SIZE = 6
+PORTFOLIO_OPEN_SORTS = ("def", "sl", "pnl", "apr")
+PORTFOLIO_CLOSED_SORTS = ("def", "pnl")
+PORTFOLIO_SORT_LABELS = {
+    "def": "По порядку",
+    "sl": "Ближе к SL",
+    "pnl": "По PnL",
+    "apr": "По APR",
+}
 
 
 def format_market_link(title: str, slug: str = "") -> str:
@@ -139,28 +148,67 @@ def live_portfolio_totals(state: Dict[str, Any], cfg: Dict[str, str]) -> Dict[st
     }
 
 
-def make_main_keyboard() -> dict:
-    """Формирует универсальную инлайн-клавиатуру бота с кнопкой инструкции."""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📊 Портфель", "callback_data": "menu_portfolio"},
-                {"text": "🧠 Решения ИИ", "callback_data": "menu_ai"},
-            ],
-            [
-                {"text": "🛡 Аварийный режим", "callback_data": "menu_emergency"},
-                {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
-            ],
-            [
-                {"text": "📜 Логи событий", "callback_data": "menu_logs"},
-                {"text": "⚡️ Пинг ИИ", "callback_data": "action_ping_ai"},
-            ],
-            [
-                {"text": "📖 Инструкция", "url": "https://github.com/ahdpe/ai-yield-scanner/blob/main/MANUAL.md"},
-                {"text": "🔄 Обновить", "callback_data": "menu_portfolio"},
-            ],
-        ]
+def make_main_keyboard(
+    extra_rows: Optional[List[List[dict]]] = None,
+    refresh_cb: str = "menu_portfolio",
+) -> dict:
+    """Формирует универсальную инлайн-клавиатуру бота с дополнительными верхними рядами."""
+    rows: List[List[dict]] = list(extra_rows or [])
+    rows.extend([
+        [
+            {"text": "📊 Портфель", "callback_data": "menu_portfolio"},
+            {"text": "🧠 Решения ИИ", "callback_data": "menu_ai"},
+        ],
+        [
+            {"text": "🛡 Аварийный режим", "callback_data": "menu_emergency"},
+            {"text": "⚙️ Настройки", "callback_data": "menu_settings"},
+        ],
+        [
+            {"text": "📜 Логи событий", "callback_data": "menu_logs"},
+            {"text": "⚡️ Пинг ИИ", "callback_data": "action_ping_ai"},
+        ],
+        [
+            {"text": "📖 Инструкция", "url": "https://github.com/ahdpe/ai-yield-scanner/blob/main/MANUAL.md"},
+            {"text": "🔄 Обновить", "callback_data": refresh_cb},
+        ],
+    ])
+    return {"inline_keyboard": rows}
+
+
+def make_portfolio_keyboard(
+    view: str,
+    sort_mode: str,
+    page: int,
+    total_pages: int,
+    open_count: int,
+    closed_count: int,
+) -> dict:
+    """Клавиатура портфеля с листанием страниц, переключением Открытые/Закрытые и сортировкой."""
+    sorts = PORTFOLIO_OPEN_SORTS if view == "open" else PORTFOLIO_CLOSED_SORTS
+    cur_sort = sort_mode if sort_mode in sorts else "def"
+    next_sort = sorts[(sorts.index(cur_sort) + 1) % len(sorts)]
+
+    extra_rows: List[List[dict]] = []
+    if total_pages > 1:
+        prev_cb = f"pf:{view}:{cur_sort}:{page - 1}" if page > 0 else "pf_edge:first"
+        next_cb = f"pf:{view}:{cur_sort}:{page + 1}" if page < total_pages - 1 else "pf_edge:last"
+        extra_rows.append([
+            {"text": "◀️", "callback_data": prev_cb},
+            {"text": f"{page + 1} / {total_pages}", "callback_data": "noop"},
+            {"text": "▶️", "callback_data": next_cb},
+        ])
+
+    toggle_btn = (
+        {"text": f"⏹ Закрытые ({closed_count})", "callback_data": "pf:closed:def:0"}
+        if view == "open"
+        else {"text": f"📊 Открытые ({open_count})", "callback_data": "pf:open:def:0"}
+    )
+    sort_btn = {
+        "text": f"🔀 {PORTFOLIO_SORT_LABELS[cur_sort]}",
+        "callback_data": f"pf:{view}:{next_sort}:0",
     }
+    extra_rows.append([toggle_btn, sort_btn])
+    return make_main_keyboard(extra_rows=extra_rows, refresh_cb=f"pf:{view}:{cur_sort}:{page}")
 
 
 def _append_bounded(lines: List[str], block: str, max_len: int = TG_SAFE_HTML_LEN) -> bool:
@@ -172,15 +220,118 @@ def _append_bounded(lines: List[str], block: str, max_len: int = TG_SAFE_HTML_LE
     return True
 
 
-def format_portfolio_msg() -> str:
-    """Формирует экран сводки реального Live-портфеля Polymarket."""
+def _paginate_blocks(
+    blocks: List[str],
+    header_len: int,
+    max_len: int = TG_SAFE_HTML_LEN,
+    per_page: int = PORTFOLIO_PAGE_SIZE,
+) -> List[List[str]]:
+    """Разбивает список карточек на страницы с учётом лимита длины HTML Telegram."""
+    if not blocks:
+        return []
+    budget = max(600, max_len - header_len - 64)
+    pages: List[List[str]] = []
+    cur_page: List[str] = []
+    cur_len = 0
+    for blk in blocks:
+        blk_len = len(blk) + 1
+        if cur_page and (len(cur_page) >= per_page or cur_len + blk_len > budget):
+            pages.append(cur_page)
+            cur_page = [blk]
+            cur_len = blk_len
+        else:
+            cur_page.append(blk)
+            cur_len += blk_len
+    if cur_page:
+        pages.append(cur_page)
+    return pages
+
+
+def _pos_stop_px(p: Dict[str, Any]) -> float:
+    entry = float(p.get("entry_price") or 0.0)
+    return float(p.get("stop_loss_price") or (round(max(0.85, entry - 0.035), 4) if entry > 0 else 0.95))
+
+
+def _sort_open_positions(open_pos: List[Dict[str, Any]], sort_mode: str) -> List[Dict[str, Any]]:
+    items = list(open_pos)
+    if sort_mode == "sl":
+        items.sort(key=lambda p: float(p.get("current_price") or p.get("entry_price") or 0.0) - _pos_stop_px(p))
+    elif sort_mode == "pnl":
+        items.sort(key=lambda p: float(p.get("unrealized_pnl_usd") or 0.0))
+    elif sort_mode == "apr":
+        items.sort(key=lambda p: float(p.get("expected_apr") or 0.0), reverse=True)
+    return items
+
+
+def _sort_closed_positions(closed_pos: List[Dict[str, Any]], sort_mode: str) -> List[Dict[str, Any]]:
+    items = list(reversed(closed_pos))
+    if sort_mode == "pnl":
+        items.sort(key=lambda p: float(p.get("realized_pnl_usd") or 0.0), reverse=True)
+    return items
+
+
+def _format_open_block(idx: int, p: Dict[str, Any]) -> str:
+    shares = float(p.get("shares") or 0.0)
+    req_shares = float(p.get("requested_shares") or 0.0)
+    alloc = float(p.get("allocated_usd") or 0.0)
+    entry = float(p.get("entry_price") or 0.0)
+    cur = float(p.get("current_price") or entry)
+    apr = float(p.get("expected_apr") or 0.0)
+    upnl = float(p.get("unrealized_pnl_usd") or 0.0)
+    ord_status = str(p.get("order_status") or "—")
+    link = format_market_link(p.get("title", "Без названия"), p.get("slug", ""))
+
+    lines_pos = [f"{idx}. 🎯 <b>{link}</b>"]
+    if req_shares > shares + 0.01 and not p.get("entry_terminal"):
+        lines_pos.append(
+            f"   ⏳ Куплено: <code>{shares:.2f}</code> из <code>{req_shares:.2f}</code> акций "
+            f"(<code>${alloc:.2f}</code>, ордер <code>{esc(ord_status)}</code>)"
+        )
+    else:
+        lines_pos.append(
+            f"   Акций: <code>{shares:.2f}</code> (<code>${alloc:.2f}</code>) | "
+            f"Статус: <code>{esc(ord_status)}</code>"
+        )
+    stop_px = _pos_stop_px(p)
+    buf_cents = (cur - stop_px) * 100.0 if cur > 0 else 0.0
+    entry_fee = float(p.get("entry_fee_usd") or 0.0)
+    fee_txt = f" | Ком.: <code>${entry_fee:.2f}</code>" if entry_fee > 0 else ""
+    lines_pos.append(
+        f"   Вход: <code>{entry:.4f}</code> → сейчас <code>{cur:.4f}</code> (SL <code>{stop_px:.4f}</code>, {buf_cents:+.1f}¢) | "
+        f"APR: <code>{apr:.1f}%</code> | PnL: <b>{upnl:+.2f}</b>{fee_txt}"
+    )
+    if p.get("execution_unknown") or p.get("reconciliation_pending"):
+        lines_pos.append("   ⚠️ <i>Требуется сверка исполнения с биржей</i>")
+    return "\n".join(lines_pos)
+
+
+def _format_closed_block(idx: int, p: Dict[str, Any]) -> str:
+    rpnl = float(p.get("realized_pnl_usd") or 0.0)
+    st = str(p.get("status") or "CLOSED")
+    reason = str(p.get("close_reason") or "").strip()
+    link = format_market_link(p.get("title", "Без названия"), p.get("slug", ""))
+    reason_txt = f"\n   <i>{esc(reason[:80])}</i>" if reason else ""
+    return (
+        f"{idx}. ⏹ {link} (<code>{esc(st)}</code>)\n"
+        f"   Итог слота: <b>{rpnl:+.2f} USDC</b>{reason_txt}"
+    )
+
+
+def format_portfolio_page(view: str = "open", sort_mode: str = "def", page: int = 0) -> Tuple[str, dict]:
+    """Формирует экран сводки Live-портфеля с постраничным листанием и сортировкой."""
+    if view not in ("open", "closed"):
+        view = "open"
+    valid_sorts = PORTFOLIO_OPEN_SORTS if view == "open" else PORTFOLIO_CLOSED_SORTS
+    if sort_mode not in valid_sorts:
+        sort_mode = "def"
+
     if not STATE_FILE.exists():
-        return "⚠️ <b>Live-портфель еще не инициализирован.</b>"
+        return "⚠️ <b>Live-портфель еще не инициализирован.</b>", make_main_keyboard()
 
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception as exc:
-        return f"⚠️ Ошибка чтения live-портфеля: {esc(exc)}"
+        return f"⚠️ Ошибка чтения live-портфеля: {esc(exc)}", make_main_keyboard()
 
     cfg = _live_config()
     health = get_ai_health()
@@ -196,14 +347,14 @@ def format_portfolio_msg() -> str:
     pnl_sign = "+" if net_pnl >= 0 else ""
     pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
 
-    msg: List[str] = ["🔴 <b>СВОДКА LIVE-ПОРТФЕЛЯ (Polymarket Smart Bonding)</b>"]
+    header: List[str] = ["🔴 <b>СВОДКА LIVE-ПОРТФЕЛЯ (Polymarket Smart Bonding)</b>"]
     if is_em:
-        msg.append(
+        header.append(
             "🚨 <b>ВНИМАНИЕ: АВАРИЙНЫЙ РЕЖИМ ИИ!</b>\n"
             "<i>Связь с Venice AI временно отсутствует. Новые входы заблокированы (Fail-Closed).</i>\n"
         )
     if t["needs_reconcile"]:
-        msg.append(
+        header.append(
             "⏸ <b>Новые входы на паузе:</b> <i>ожидается сверка исполнения по открытой заявке с биржей.</i>\n"
         )
 
@@ -214,7 +365,7 @@ def format_portfolio_msg() -> str:
         else f"💳 <b>Свободный кэш CLOB:</b> <b>${t['cash']:,.2f} pUSD</b>"
     )
 
-    msg.extend([
+    header.extend([
         f"⏱ <i>В работе: {elapsed_hours:.1f} ч | Тиков: {state.get('tick_count', 0)} (посл. {last_tick_str})</i>\n",
         f"💼 <b>Лимит стратегии:</b> ${t['deposit']:,.0f} USDC ({t['max_slots']} слотов × ${t['slot_size']:,.0f})",
         f"💵 <b>Оценка счёта (Equity):</b> <b>${t['equity']:,.2f} pUSD</b>",
@@ -222,67 +373,41 @@ def format_portfolio_msg() -> str:
         f"   • Переоценка открытых: <code>${t['unrealized']:+.2f}</code> | Зафиксировано: <code>${t['realized']:+.2f}</code>",
         f"📦 <b>В позициях (подтв.):</b> ${t['open_cost']:,.2f} → сейчас ${t['open_value']:,.2f}",
         f"🔥 <b>APR активных слотов:</b> <b>{t['weighted_apr']:.1f}% годовых</b> (~${t['daily_est']:.2f}/день)",
-        f"{cash_line}\n",
-        f"<b>Открытые позиции ({len(t['open_pos'])} / {t['max_slots']}):</b>",
+        f"{cash_line}",
     ])
 
-    if not t["open_pos"]:
-        msg.append("   <i>Открытых позиций пока нет.</i>")
+    open_count = len(t["open_pos"])
+    closed_count = len(t["closed_pos"])
+    if view == "open":
+        items = _sort_open_positions(t["open_pos"], sort_mode)
+        blocks = [_format_open_block(i, p) for i, p in enumerate(items, 1)]
+        empty_text = "   <i>Открытых позиций пока нет.</i>"
+        base_title = f"Открытые позиции ({open_count} / {t['max_slots']})"
     else:
-        for i, p in enumerate(t["open_pos"], 1):
-            shares = float(p.get("shares") or 0.0)
-            req_shares = float(p.get("requested_shares") or 0.0)
-            alloc = float(p.get("allocated_usd") or 0.0)
-            entry = float(p.get("entry_price") or 0.0)
-            cur = float(p.get("current_price") or entry)
-            apr = float(p.get("expected_apr") or 0.0)
-            upnl = float(p.get("unrealized_pnl_usd") or 0.0)
-            ord_status = str(p.get("order_status") or "—")
-            link = format_market_link(p.get("title", "Без названия"), p.get("slug", ""))
+        items = _sort_closed_positions(t["closed_pos"], sort_mode)
+        blocks = [_format_closed_block(i, p) for i, p in enumerate(items, 1)]
+        empty_text = "   <i>Закрытых и разрешённых сделок пока нет.</i>"
+        base_title = f"Закрытые и разрешённые ({closed_count})"
 
-            lines_pos = [f"{i}. 🎯 <b>{link}</b>"]
-            if req_shares > shares + 0.01 and not p.get("entry_terminal"):
-                lines_pos.append(
-                    f"   ⏳ Куплено: <code>{shares:.2f}</code> из <code>{req_shares:.2f}</code> акций "
-                    f"(<code>${alloc:.2f}</code>, ордер <code>{esc(ord_status)}</code>)"
-                )
-            else:
-                lines_pos.append(
-                    f"   Акций: <code>{shares:.2f}</code> (<code>${alloc:.2f}</code>) | "
-                    f"Статус: <code>{esc(ord_status)}</code>"
-                )
-            stop_px = float(p.get("stop_loss_price") or (round(max(0.85, entry - 0.035), 4) if entry > 0 else 0.95))
-            entry_fee = float(p.get("entry_fee_usd") or 0.0)
-            fee_txt = f" | Ком.: <code>${entry_fee:.2f}</code>" if entry_fee > 0 else ""
-            lines_pos.append(
-                f"   Вход: <code>{entry:.4f}</code> → сейчас <code>{cur:.4f}</code> (SL <code>{stop_px:.4f}</code>) | "
-                f"APR: <code>{apr:.1f}%</code> | PnL: <b>{upnl:+.2f}</b>{fee_txt}"
-            )
-            if p.get("execution_unknown") or p.get("reconciliation_pending"):
-                lines_pos.append("   ⚠️ <i>Требуется сверка исполнения с биржей</i>")
-            _append_bounded(msg, "\n".join(lines_pos))
+    header_str = "\n".join(header)
+    pages = _paginate_blocks(blocks, len(header_str) + len(base_title) + 24)
+    total_pages = max(1, len(pages))
+    cur_page = max(0, min(int(page), total_pages - 1))
 
-    if t["closed_pos"]:
-        recent_closed = list(reversed(t["closed_pos"]))
-        _append_bounded(msg, f"\n<b>Последние закрытые / разрешённые ({len(recent_closed)}):</b>")
-        shown = 0
-        for idx, p in enumerate(recent_closed, 1):
-            rpnl = float(p.get("realized_pnl_usd") or 0.0)
-            st = str(p.get("status") or "CLOSED")
-            reason = str(p.get("close_reason") or "").strip()
-            link = format_market_link(p.get("title", "Без названия"), p.get("slug", ""))
-            reason_txt = f"\n   <i>{esc(reason[:80])}</i>" if reason else ""
-            block = (
-                f"{idx}. ⏹ {link} (<code>{esc(st)}</code>)\n"
-                f"   Итог слота: <b>{rpnl:+.2f} USDC</b>{reason_txt}"
-            )
-            if not _append_bounded(msg, block, max_len=TG_SAFE_HTML_LEN - 80):
-                left = len(recent_closed) - shown
-                msg.append(f"<i>… и ещё {left} закрытых сделок</i>")
-                break
-            shown += 1
+    sort_tag = f" · {PORTFOLIO_SORT_LABELS[sort_mode]}" if sort_mode != "def" else ""
+    page_tag = f" · стр. {cur_page + 1}/{total_pages}" if total_pages > 1 else ""
+    section_title = f"\n<b>{base_title}{sort_tag}{page_tag}:</b>"
 
-    return "\n".join(msg)
+    body_blocks = pages[cur_page] if pages else [empty_text]
+    text = "\n".join([header_str, section_title, *body_blocks])
+    kb = make_portfolio_keyboard(view, sort_mode, cur_page, total_pages, open_count, closed_count)
+    return text, kb
+
+
+def format_portfolio_msg() -> str:
+    """Формирует первую страницу сводки реального Live-портфеля Polymarket."""
+    text, _kb = format_portfolio_page(view="open", sort_mode="def", page=0)
+    return text
 
 
 def format_emergency_msg() -> str:
@@ -473,6 +598,19 @@ def format_manual_msg() -> str:
     )
 
 
+def _parse_portfolio_callback(data: str) -> Tuple[str, str, int]:
+    """Разбирает callback_data вида 'pf:<view>:<sort>:<page>' с безопасным фолбэком."""
+    parts = data.split(":")
+    view = parts[1] if len(parts) > 1 and parts[1] in ("open", "closed") else "open"
+    valid_sorts = PORTFOLIO_OPEN_SORTS if view == "open" else PORTFOLIO_CLOSED_SORTS
+    sort_mode = parts[2] if len(parts) > 2 and parts[2] in valid_sorts else "def"
+    try:
+        page = max(0, int(parts[3])) if len(parts) > 3 else 0
+    except ValueError:
+        page = 0
+    return view, sort_mode, page
+
+
 class SimpleTelegramBot:
     def __init__(self, token: str, admin_id: str):
         self.token = token
@@ -482,8 +620,13 @@ class SimpleTelegramBot:
     def api_call(self, method: str, payload: dict) -> dict:
         return tg_api_call(self.token, method, payload)
 
-    def send_menu(self, chat_id: str, text: str):
-        tg_send_message(self.token, chat_id, text, reply_markup=make_main_keyboard())
+    def send_menu(self, chat_id: str, text: str, reply_markup: Optional[dict] = None):
+        tg_send_message(self.token, chat_id, text, reply_markup=reply_markup or make_main_keyboard())
+
+    def edit_menu(self, chat_id: str, message_id: Optional[int], text: str, reply_markup: Optional[dict] = None):
+        markup = reply_markup if reply_markup is not None else make_main_keyboard()
+        if message_id is None or not tg_edit_message(self.token, chat_id, int(message_id), text, reply_markup=markup):
+            tg_send_message(self.token, chat_id, text, reply_markup=markup)
 
     def answer_callback(self, cb_id: str, text: str = ""):
         self.api_call("answerCallbackQuery", {
@@ -499,7 +642,7 @@ class SimpleTelegramBot:
         max_slots = int(cfg.get("LIVE_MAX_SLOTS") or 5)
         model_str, consensus_mode = _models_label()
 
-        print(f"Запуск Live Telegram-бота (Admin ID: {self.admin_id})...", flush=True)
+        print("Запуск Live Telegram-бота (admin)...", flush=True)
         self.send_menu(
             self.admin_id,
             "🔴 <b>Live ИИ-Бот запущен и переключён на реальный счёт!</b>\n\n"
@@ -531,7 +674,8 @@ class SimpleTelegramBot:
 
                         text = msg.get("text", "").strip()
                         if text in ("/start", "/menu", "/portfolio", "/status"):
-                            self.send_menu(chat_id, format_portfolio_msg())
+                            pf_text, pf_kb = format_portfolio_page(view="open", sort_mode="def", page=0)
+                            self.send_menu(chat_id, pf_text, reply_markup=pf_kb)
                         elif text in ("/ai", "/verdicts"):
                             self.send_menu(chat_id, format_ai_verdicts_msg())
                         elif text in ("/emergency", "/safe"):
@@ -555,13 +699,26 @@ class SimpleTelegramBot:
                         cb = u["callback_query"]
                         cb_id = cb["id"]
                         data = cb.get("data", "")
-                        chat_id = str(cb["message"]["chat"]["id"])
-                        if chat_id != self.admin_id:
+                        msg_obj = cb.get("message") or {}
+                        chat_id = str((msg_obj.get("chat") or {}).get("id") or "")
+                        if not chat_id or chat_id != self.admin_id:
                             continue
 
                         if data == "menu_portfolio":
                             self.answer_callback(cb_id)
-                            self.send_menu(chat_id, format_portfolio_msg())
+                            pf_text, pf_kb = format_portfolio_page(view="open", sort_mode="def", page=0)
+                            self.send_menu(chat_id, pf_text, reply_markup=pf_kb)
+                        elif data.startswith("pf:"):
+                            view, sort_mode, page = _parse_portfolio_callback(data)
+                            pf_text, pf_kb = format_portfolio_page(view=view, sort_mode=sort_mode, page=page)
+                            self.answer_callback(cb_id)
+                            self.edit_menu(chat_id, msg_obj.get("message_id"), pf_text, reply_markup=pf_kb)
+                        elif data == "pf_edge:first":
+                            self.answer_callback(cb_id, text="Это первая страница")
+                        elif data == "pf_edge:last":
+                            self.answer_callback(cb_id, text="Это последняя страница")
+                        elif data == "noop":
+                            self.answer_callback(cb_id)
                         elif data == "menu_ai":
                             self.answer_callback(cb_id)
                             self.send_menu(chat_id, format_ai_verdicts_msg())

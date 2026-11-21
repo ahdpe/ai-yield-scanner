@@ -65,28 +65,67 @@ def tg_api_call(token: str, method: str, payload: dict, timeout: int = 35) -> di
         return {"ok": False, "error": str(e)}
 
 
-def tg_send_message(token: str, chat_id: str, text: str, reply_markup: Optional[dict] = None) -> bool:
-    """Отправляет HTML-сообщение; если Telegram его отверг (разметка/длина) — повторяет простым текстом."""
+def _deliver_tg_message(
+    token: str,
+    method: str,
+    base_payload: dict,
+    text: str,
+    reply_markup: Optional[dict] = None,
+) -> bool:
+    """Отправляет или редактирует HTML-сообщение с фолбэком на простой текст при ошибке парсинга/длины."""
     payload = {
-        "chat_id": chat_id,
+        **base_payload,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if reply_markup:
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
 
-    res = tg_api_call(token, "sendMessage", payload) if len(text) <= TG_MAX_LEN else {"ok": False, "error": "message too long"}
+    res = (
+        tg_api_call(token, method, payload)
+        if len(text) <= TG_MAX_LEN
+        else {"ok": False, "error": "message too long"}
+    )
     if res.get("ok"):
         return True
+    err_str = str(res.get("error") or "")
+    if method == "editMessageText" and "message is not modified" in err_str.lower():
+        return True
 
-    print(f"[telegram] sendMessage (HTML) не доставлено: {res.get('error')} — повтор простым текстом", flush=True)
-    payload.pop("parse_mode")
+    print(f"[telegram] {method} (HTML) не доставлено: {err_str} — повтор простым текстом", flush=True)
+    payload.pop("parse_mode", None)
     payload["text"] = fit_message(html_to_plain(text))
-    res = tg_api_call(token, "sendMessage", payload)
-    if not res.get("ok"):
-        print(f"[telegram] sendMessage не доставлено: {res.get('error')}", flush=True)
-    return bool(res.get("ok"))
+    res = tg_api_call(token, method, payload)
+    if res.get("ok"):
+        return True
+    err_plain = str(res.get("error") or "")
+    if method == "editMessageText" and "message is not modified" in err_plain.lower():
+        return True
+    print(f"[telegram] {method} не доставлено: {err_plain}", flush=True)
+    return False
+
+
+def tg_send_message(token: str, chat_id: str, text: str, reply_markup: Optional[dict] = None) -> bool:
+    """Отправляет HTML-сообщение; если Telegram его отверг (разметка/длина) — повторяет простым текстом."""
+    return _deliver_tg_message(token, "sendMessage", {"chat_id": chat_id}, text, reply_markup=reply_markup)
+
+
+def tg_edit_message(
+    token: str,
+    chat_id: str,
+    message_id: int,
+    text: str,
+    reply_markup: Optional[dict] = None,
+) -> bool:
+    """Редактирует существующее HTML-сообщение по message_id с защитой от 'message is not modified'."""
+    return _deliver_tg_message(
+        token,
+        "editMessageText",
+        {"chat_id": chat_id, "message_id": int(message_id)},
+        text,
+        reply_markup=reply_markup,
+    )
 
 
 def send_telegram_alert(message: str, chat_id: Optional[str] = None) -> bool:
