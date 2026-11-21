@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -45,6 +46,8 @@ ENTRY_SKIP_CACHE_TTL_SEC = 24 * 3600.0
 ENTRY_HIGH_SKIP_CACHE_TTL_SEC = 36 * 3600.0
 # Компактный размер правил резолюции при плановом реаудите уже открытой позиции (правила проверены при входе и не меняются)
 REAUDIT_DESCRIPTION_MAX_CHARS = 800
+# Максимальный возраст заголовков Google News RSS для резервного анализатора (дней)
+GOOGLE_NEWS_MAX_AGE_DAYS = 21
 
 SPORTS_KEYWORDS = [
     r"\bvs\.?\b", r"\bbo1\b", r"\bbo3\b", r"\bbo5\b", r"\bufc\b",
@@ -703,22 +706,41 @@ def _build_news_query(question: str) -> str:
     return " ".join(words)
 
 
-def _fetch_google_news_context(question: str, max_items: int = 6) -> str:
-    """Читает свежие заголовки из Google News RSS (бесплатно, stdlib); при сбое возвращает пустую строку."""
+def _fetch_google_news_context(
+    question: str,
+    max_items: int = 6,
+    max_age_days: int = GOOGLE_NEWS_MAX_AGE_DAYS,
+) -> str:
+    """Читает свежие заголовки из Google News RSS (не старше max_age_days дн.); при сбое возвращает пустую строку."""
     query = _build_news_query(question)
-    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+    rss_query = f"{query} when:{max_age_days}d" if max_age_days > 0 else query
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(rss_query)}&hl=en-US&gl=US&ceid=US:en"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             xml_bytes = resp.read()
         root = ET.fromstring(xml_bytes)
-        lines: List[str] = []
-        for item in root.findall("./channel/item")[:max_items]:
+        now_dt = datetime.now(timezone.utc)
+        fresh_items: List[Tuple[float, str, str]] = []
+        for item in root.findall("./channel/item"):
             title = (item.findtext("title") or "").strip()
-            pub = (item.findtext("pubDate") or "").strip()[:22]
-            if title:
-                lines.append(f"- [{pub}] {title}" if pub else f"- {title}")
-        return "\n".join(lines)
+            pub_raw = (item.findtext("pubDate") or "").strip()
+            if not title or not pub_raw:
+                continue
+            try:
+                pub_dt = parsedate_to_datetime(pub_raw)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if pub_dt is None:
+                continue
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+            age_days = (now_dt - pub_dt).total_seconds() / 86400.0
+            if age_days > float(max_age_days) or age_days < -1.0:
+                continue
+            fresh_items.append((pub_dt.timestamp(), pub_raw[:22], title))
+        fresh_items.sort(key=lambda row: row[0], reverse=True)
+        return "\n".join(f"- [{pub}] {title}" for _, pub, title in fresh_items[:max_items])
     except Exception:
         return ""
 

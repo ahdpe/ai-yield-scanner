@@ -242,7 +242,7 @@ def read_execution(client: Any, order_id: str, token_id: str, side: str,
     if order_error is not None:
         if abs(confirmed - expected) <= _EPS:
             status = "CONFIRMED"
-        elif (probe_missing_partial and order_is_null and side == "BUY" and market
+        elif (probe_missing_partial and order_is_null and side in ("BUY", "SELL") and market
               and 0 < confirmed < expected - _EPS and not unsettled_trades):
             other_token_order = _check_open_order_absence(client, market, order_id, token_id)
             return {
