@@ -6,22 +6,26 @@ A real-money **Polymarket Smart Bonding** bot with a two-model LLM risk audit (V
 
 ## Strategy
 
-- **Universe:** top-500 active Polymarket markets by 24h volume (Gamma API, paginated).
-- **Entry:** leading outcome **94.5¢–98.5¢**, expiry **0.5–45 days**, liquidity ≥ **$25,000**, book spread ≤ **1.5¢**, fee rate ≤ **0.06**. Sports and crypto price targets are excluded. A market without a valid `endDate` is rejected.
-- **Position:** **10 slots × $100** (strategy limit $1,000). Buy at the best ask, then reconcile confirmed fills and fees against the actual conditional-token balance.
-- **Risk:** relative stop-loss **-3.5¢** from entry (floor $0.85), max **2 open slots per topic cluster**, 12h reopen cooldown, 6h AI re-audit. Two fresh `SKIP` verdicts close a position.
+Slots and limits are configured in `state/live_config.env` (not in the repo). Production currently runs **30 slots × $50** for a **$1,500** strategy limit; the defaults below describe the mechanics, not the current numbers.
+
+- **Universe:** top-500 active Polymarket markets by 24h volume (Gamma API, paginated). The scan is skipped entirely when slots are full, cash is below $10 or the AI entry budget is exhausted.
+- **Entry:** leading outcome **94.5¢–98.5¢**, expiry **0.5–45 days**, liquidity ≥ **$25,000**, book spread ≤ **1.5¢**, fee rate ≤ **0.06**, risk score ≥ **80**, and no "falling knife": 1h price move **< 1.0¢** and 24h move **< 2.5¢**. Sports and crypto price targets are excluded, as are markets without a valid `endDate`.
+- **Entry ladder by fill ratio:** `<50%` filled → APR ≥ **35%**, expiry ≤ 45 days, AI confidence ≥ **75%**; `50–80%` → APR ≥ **50%**, ≤ 21 days, ≥ **80%**; `>=80%` → APR ≥ **80%**, ≤ 14 days, ≥ **85%**. This keeps a reserve for the best setups instead of tapering quality.
+- **Quality guards:** at most **40%** of slots in long-horizon positions (> 21 days), at most **1 open slot per Gamma event** (`event_id`), bid depth ≥ **$250** within 2¢ of the best bid, and max **2 open slots per topic cluster**.
+- **Risk:** relative stop-loss **-3.5¢** from entry (floor $0.85), checked every **20 s**. A breach must persist for **2 consecutive checks** inside a 3-minute window, unless it is a panic gap (bid ≤ stop − 3¢ and ask ≤ stop + 0.5¢). A hole wider than 3¢ at mid ≥ stop is treated as a book artifact, not a crash. 12h reopen cooldown.
+- **Take-profit:** rotates capital out of a position whose remaining APR has fallen below **20%** with ≥ 10 days left, provided the bid rose ≥ 1.8¢ (or ≥ $0.988) and the net gain after the SELL fee is ≥ $0.20 and ≥ 0.3¢/share. It never fires on an incomplete entry or with an unknown fee schedule.
 - **Execution:** `polymarket-client` `SecureClient` (Polymarket Deposit Wallet, `signature_type=3`, pUSD). The intent is persisted before the order is submitted; an ambiguous submission fails closed and requires reconciliation.
 
 ### Stop-loss behavior
 
-A stop-loss SELL is placed at the current best bid (one tick below it for a higher fill probability). If the order is still unfilled after 60 seconds, or if the market has moved so that its limit is above the current best bid, the trader cancels it, waits for the cancellation to be confirmed by reconciliation, and re-quotes at the new best bid. A new SELL is never sent while an old one is still live or unconfirmed.
+A stop-loss SELL is placed one tick below the current best bid. If it is still unfilled after 60 seconds, or if the market has moved so that its limit is above the current best bid, the trader cancels it, waits for the cancellation to be confirmed by reconciliation, and re-quotes at the new best bid. A new SELL is never sent while an old one is still live or unconfirmed. Zero-fill SELLs that disappear from the book are recovered as `RECOVERED_CANCELLED` instead of leaving the slot stuck.
 
 ## AI audit
 
-- Every entry requires **2/2 APPROVE** with confidence ≥ 70 from `claude-sonnet-5-5` + `grok-4-6` (Venice web search enabled). Anything else is `SKIP` (fail-closed).
-- Open positions are re-audited every 6 hours with one model; the first `SKIP` triggers a recheck in 1 hour, and a second fresh `SKIP` closes the position.
-- **Budget:** Venice allows 240 paid calls per UTC day, 96 reserved for re-audits. Command Code is the automatic failover provider with a separate 240/96 budget. If both are unavailable or exhausted, new entries are blocked.
-- Prompt version 3: English prompt, Russian `summary`, market rules capped at 4,000 characters, verdict cache 6h.
+- Every entry requires **2/2 APPROVE** from `claude-sonnet-5-5` + `grok-4-6` (Venice web search enabled) with a confidence at least equal to the current entry tier (75/80/85%). Anything else is `SKIP` (fail-closed).
+- **Adaptive re-audit:** calm positions (drawdown < 1¢, > 3 days left, no SKIP streak) every **24h via Command Code**; watch (drawdown 1–2¢ or ≤ 3 days) every **6h via Venice**; stressed (drawdown ≥ 2¢ or a SKIP streak) every **1h via Venice**. Two hard `SKIP` verdicts (confidence ≥ 75%) close the position.
+- **Budget:** separate per-provider daily pools with entry/re-audit split. Production currently uses Venice **55/15** (total/reserve) and Command Code **480/192**. If both are unavailable or exhausted, new entries are blocked. Budget files are read with a soft migration from the older single-counter format.
+- Prompt version 3: English prompt, Russian `summary`, market rules capped at 4,000 characters, verdict cache 6h for APPROVE and 24–36h for SKIP.
 
 ## Architecture
 
@@ -107,9 +111,11 @@ Do not run `git pull` on the VPS until the server-side working tree is reconcile
 
 ## Known limitations
 
-- A stop-loss can gap through its trigger, and a market can have no bid. The re-quote logic keeps retrying, but it cannot guarantee a fill.
-- An ambiguous order submission without an `order_id` still requires manual reconciliation; automatic discovery by account trades is not implemented yet.
+- A stop-loss can gap through its trigger, and a market can have no bid. The 20s guard, panic override and re-quote loop keep retrying, but they cannot guarantee a fill.
+- An ambiguous order submission without an `order_id` still requires manual reconciliation; automatic discovery by account trades is not implemented yet. Missing partial SELLs are recovered, but not via a full order search.
 - Resolved positions rely on Polymarket auto-redeem. The bot records `redemption_pending` but does not confirm it or call `redeem_positions()` itself.
-- The Telegram bot is read-only and has no second-instance lock (the trader has `flock`); never run two bots with the same token.
+- The Telegram bot is read-only and has no second-instance lock (the trader has `flock`); never run two bots with the same token. The bot loads `state/live_config.env`, so it also sees the wallet key even though it only reads the portfolio.
 - There is no committed test suite yet; use throwaway mock tests before every restart.
+- `state/live_trader.log` has no rotation and `state/live_portfolio_state.json` is only backed up manually before deploys.
+- `state.initial_deposit_usd` can lag behind `LIVE_TOTAL_DEPOSIT` after a limit change; treat the config as authoritative and the state field as historical.
 - Smart Bonding sells tail risk: a single full loss can exceed many small gains. Profitability is not guaranteed.
