@@ -614,28 +614,32 @@ def should_trigger_stop_loss(
     if pos.get("exit_kind") != "take_profit" and any(not x.get("complete") for x in pos.get("exit_orders", [])):
         return True, f"лучший bid ${bid:.4f} ниже стопа ${stop_px:.4f} (-3.5¢)"
 
-    ask = float(summary["best_ask"]) if summary.get("best_ask") is not None else bid
-    spread = ask - bid
-    mid = (bid + ask) / 2.0
+    raw_ask = summary.get("best_ask")
+    has_ask = raw_ask is not None
+    ask = float(raw_ask) if has_ask else None
     now = time.time()
 
-    # Если аск остался высоко (mid >= stop_px), а спред разъехался > 3¢ — это дырка в бидах, а не обвал
-    if spread > STOP_LOSS_MAX_HOLE_SPREAD and mid >= stop_px:
-        pos.pop("stop_breach_streak", None)
-        pos.pop("stop_breach_at", None)
-        if now - float(pos.get("last_hole_log_at") or 0.0) >= 300.0:
-            pos["last_hole_log_at"] = now
-            log_live_event(
-                f"🛡 Игнорируем прокол пустого стакана {pos.get('title', '')[:38]}: "
-                f"bid=${bid:.4f} < SL=${stop_px:.4f}, но ask=${ask:.4f} (mid=${mid:.4f}, спред {spread*100:.1f}¢)"
-            )
-        return False, ""
+    if has_ask:
+        spread = ask - bid
+        mid = (bid + ask) / 2.0
 
-    # Экстренный обвал всего стакана (и bid, и ask глубоко под стопом) — выходим сразу с 1-го замера
-    if bid <= stop_px - STOP_LOSS_PANIC_OFFSET and ask <= stop_px + 0.005:
-        pos["stop_breach_streak"] = STOP_LOSS_CONFIRM_STREAK
-        pos["stop_breach_at"] = now
-        return True, f"экстренный пробой стопа: bid ${bid:.4f} / ask ${ask:.4f} ниже ${stop_px:.4f}"
+        # Если аск остался высоко (mid >= stop_px), а спред разъехался > 3¢ — это дырка в бидах, а не обвал
+        if spread > STOP_LOSS_MAX_HOLE_SPREAD and mid >= stop_px:
+            pos.pop("stop_breach_streak", None)
+            pos.pop("stop_breach_at", None)
+            if now - float(pos.get("last_hole_log_at") or 0.0) >= 300.0:
+                pos["last_hole_log_at"] = now
+                log_live_event(
+                    f"🛡 Игнорируем прокол пустого стакана {pos.get('title', '')[:38]}: "
+                    f"bid=${bid:.4f} < SL=${stop_px:.4f}, но ask=${ask:.4f} (mid=${mid:.4f}, спред {spread*100:.1f}¢)"
+                )
+            return False, ""
+
+        # Экстренный обвал всего стакана (и bid, и реально наблюдаемый ask глубоко под стопом) — выход с 1-го замера
+        if bid <= stop_px - STOP_LOSS_PANIC_OFFSET and ask <= stop_px + 0.005:
+            pos["stop_breach_streak"] = STOP_LOSS_CONFIRM_STREAK
+            pos["stop_breach_at"] = now
+            return True, f"экстренный пробой стопа: bid ${bid:.4f} / ask ${ask:.4f} ниже ${stop_px:.4f}"
 
     prev_at = float(pos.get("stop_breach_at") or 0.0)
     prev_streak = int(pos.get("stop_breach_streak") or 0)
@@ -644,10 +648,11 @@ def should_trigger_stop_loss(
     streak = prev_streak + 1
     pos["stop_breach_streak"] = streak
     pos["stop_breach_at"] = now
+    ask_txt = f"ask=${ask:.4f}" if has_ask else "ask=н/д"
     if streak < STOP_LOSS_CONFIRM_STREAK:
         log_live_event(
             f"⏳ Пробой стопа {pos.get('title', '')[:38]} ({streak}/{STOP_LOSS_CONFIRM_STREAK}): "
-            f"bid=${bid:.4f} < SL=${stop_px:.4f} (ask=${ask:.4f}), ждём подтверждения..."
+            f"bid=${bid:.4f} < SL=${stop_px:.4f} ({ask_txt}), ждём подтверждения..."
         )
         return False, ""
 
@@ -871,10 +876,16 @@ def _confirm_missing_sell(
 
     order["missing_sell_recovery"] = {"at": now, "snapshot": snapshot, "wallet_shares": observation["wallet_shares"]}
     order.pop("missing_sell_observation", None)
-    log_live_event(
-        f"✅ Сверка SELL восстановлена: {pos['title'][:45]}, "
-        f"подтверждена продажа {confirmed_sold} акций, неисполненный остаток заявки отсутствует на бирже."
-    )
+    if confirmed_sold > 0:
+        log_live_event(
+            f"✅ Сверка SELL восстановлена: {pos['title'][:45]}, "
+            f"подтверждена продажа {confirmed_sold} акций, неисполненный остаток заявки отсутствует на бирже."
+        )
+    else:
+        log_live_event(
+            f"✅ Сверка SELL восстановлена: {pos['title'][:45]}, "
+            "подтверждена отмена без исполнений (0 акций), заявка отсутствует на бирже."
+        )
     return True
 
 
@@ -1013,7 +1024,10 @@ def reconcile_position(client: SecureClient, state: Dict[str, Any], pos: Dict[st
                     has_other_pending_exits=has_other_pending,
                 ):
                     return False
-                exit_rec.update(status="RECOVERED_PARTIAL", terminal=True, settled=True, complete=True)
+                recovered_status = (
+                    "RECOVERED_CANCELLED" if float(exit_rec["confirmed_shares"]) <= 0 else "RECOVERED_PARTIAL"
+                )
+                exit_rec.update(status=recovered_status, terminal=True, settled=True, complete=True)
 
         remaining = max(0.0, net_bought - sold)
         avg = cost / net_bought if net_bought > 0 else float(pos["entry_price"])
