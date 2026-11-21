@@ -10,7 +10,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
@@ -40,6 +40,11 @@ BACKUP_REAUDIT_RESERVE_CALLS = int(os.environ.get("COMMANDCODE_REAUDIT_RESERVE_C
 VENICE_BILLING_COOLDOWN_SEC = 900.0
 _venice_cooldown_until: float = 0.0
 _venice_cooldown_date: str = ""
+# Удлиненный кэш для отклонённых на входе рынков (SKIP), чтобы не тратить Venice каждые 6 ч на один и тот же рынок
+ENTRY_SKIP_CACHE_TTL_SEC = 24 * 3600.0
+ENTRY_HIGH_SKIP_CACHE_TTL_SEC = 36 * 3600.0
+# Компактный размер правил резолюции при плановом реаудите уже открытой позиции (правила проверены при входе и не меняются)
+REAUDIT_DESCRIPTION_MAX_CHARS = 800
 
 SPORTS_KEYWORDS = [
     r"\bvs\.?\b", r"\bbo1\b", r"\bbo3\b", r"\bbo5\b", r"\bufc\b",
@@ -52,11 +57,21 @@ SPORTS_KEYWORDS = [
 ]
 
 CRYPTO_ASSET_RE = re.compile(
-    r"\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|bnb|cardano|ada|avax|sui|hyperliquid|hype|crypto)\b",
+    r"(\b(?:bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|bnb|cardano|ada|avax|sui|hyperliquid|hype|crypto|"
+    r"crude oil|wti|brent|nasdaq|s&p\s*500|sp500|dow jones|which asset)\b|"
+    r"\bgold\s*\(gc\)|\bsilver\s*\(si\))",
     re.IGNORECASE,
 )
 CRYPTO_PRICE_TRIGGER_RE = re.compile(
-    r"(\$|price of|dip to|reach\b|hit\b|above\b|below\b|all[- ]time high|\bath\b|market cap)",
+    r"(\$|price of|dip to|reach\b|hit\b|above\b|below\b|all[- ]time high|\bath\b|market cap|"
+    r"up or down|best performance in 20\d\d)",
+    re.IGNORECASE,
+)
+STREAMER_NOISE_RE = re.compile(
+    r"(\bkai cenat\b|\bishowspeed\b|\bmrbeast\b|\bxqc\b|\basmongold\b|\badin ross\b|"
+    r"\bmarathon\b|\blivestream\b|\btwitch\b|\byoutubers?\b|\byoutube\b|"
+    r"\bpost\s+\d+\s*(?:-\s*\d+)?\s*(?:tweets?|posts?)\b|\btweets?\s+from\b|"
+    r"\bhow many (?:times|tweets?|posts?)\b.*\b(?:post|tweet)\b)",
     re.IGNORECASE,
 )
 
@@ -100,12 +115,7 @@ def get_commandcode_models() -> List[str]:
 
 
 def get_commandcode_model_for_slot(slot_idx: int, venice_model: str) -> str:
-    """Подбирает модель Command Code для указанного слота консенсуса."""
-    raw = os.environ.get("COMMANDCODE_MODELS", "").strip()
-    if raw:
-        cc_models = [m.strip() for m in raw.split(",") if m.strip()]
-        if cc_models:
-            return cc_models[slot_idx % len(cc_models)]
+    """Подбирает модель Command Code для указанного слота консенсуса (сохраняя семейство модели)."""
     mapping = {
         "grok-4-6": "xai/grok-4.6",
         "grok-4-7": "xai/grok-4.7",
@@ -114,10 +124,16 @@ def get_commandcode_model_for_slot(slot_idx: int, venice_model: str) -> str:
         "gemini-4-carbon": "google/gemini-4-carbon",
         "gemini-4-neon": "google/gemini-4-neon",
     }
-    if venice_model in mapping:
-        return mapping[venice_model]
-    if venice_model.startswith("claude-"):
-        return venice_model
+    mapped = mapping.get(venice_model) or (venice_model if venice_model.startswith("claude-") else "")
+    raw = os.environ.get("COMMANDCODE_MODELS", "").strip()
+    if raw:
+        cc_models = [m.strip() for m in raw.split(",") if m.strip()]
+        if cc_models:
+            if mapped and mapped in cc_models:
+                return mapped
+            return cc_models[slot_idx % len(cc_models)]
+    if mapped:
+        return mapped
     cc_defaults = get_commandcode_models()
     return cc_defaults[slot_idx % len(cc_defaults)]
 
@@ -243,8 +259,10 @@ def classify_polymarket_risk(market: Dict[str, Any]) -> Dict[str, Any]:
         or market.get("gameId")
         or any(re.search(pat, question) for pat in SPORTS_KEYWORDS)
     )
+    is_streamer_noise = bool(STREAMER_NOISE_RE.search(question))
     is_crypto_price_target = bool(
-        CRYPTO_ASSET_RE.search(question) and CRYPTO_PRICE_TRIGGER_RE.search(question)
+        (CRYPTO_ASSET_RE.search(question) and CRYPTO_PRICE_TRIGGER_RE.search(question))
+        or is_streamer_noise
     )
     has_ambiguity = any(kw in full_text for kw in AMBIGUITY_KEYWORDS)
     has_official_source = any(kw in full_text for kw in OFFICIAL_SOURCES_KEYWORDS)
@@ -258,9 +276,12 @@ def classify_polymarket_risk(market: Dict[str, Any]) -> Dict[str, Any]:
     if is_sports:
         score -= 45
         reasons.append("Спорт/Киберспорт (высокий риск резких скачков цены в лайве)")
+    elif is_streamer_noise:
+        score -= 40
+        reasons.append("Стримы/блогеры/твиты (лайв-шум без покрытия в официальных СМИ)")
     elif is_crypto_price_target:
         score -= 35
-        reasons.append("Крипто-таргет цены (риск резкого пробоя стоп-лосса и нет лайв-котировок у ИИ)")
+        reasons.append("Биржевой/крипто-таргет цены (риск резкого пробоя стоп-лосса и нет лайв-котировок у ИИ)")
     else:
         reasons.append("Макро/Политика/События (нет секундных лайв-скачков)")
 
@@ -370,41 +391,71 @@ def _notify_budget_limit_once(kind: str, today: str, calls: int, detail: str = "
         pass
 
 
-def _read_budget_calls(budget_file: Path, today: str) -> int:
-    """Читает число израсходованных вызовов за указанную дату UTC из файла бюджета."""
+def _read_budget_state(budget_file: Path, today: str, total_reserve: int = 0) -> Tuple[int, int, int]:
+    """Читает (calls, entry_calls, reaudit_calls) за дату UTC с мягкой миграцией старого формата."""
     if budget_file.exists():
         try:
             b = json.loads(budget_file.read_text(encoding="utf-8"))
-            return int(b.get("calls", 0)) if b.get("date") == today else 0
+            if b.get("date") == today:
+                calls = max(0, int(b.get("calls", 0)))
+                if "entry_calls" in b or "reaudit_calls" in b:
+                    entry_calls = max(0, int(b.get("entry_calls", 0)))
+                    reaudit_calls = max(0, int(b.get("reaudit_calls", 0)))
+                    return max(calls, entry_calls + reaudit_calls), entry_calls, reaudit_calls
+                reaudit_calls = min(calls, max(0, total_reserve))
+                entry_calls = max(0, calls - reaudit_calls)
+                return calls, entry_calls, reaudit_calls
         except Exception:
             pass
-    return 0
+    return 0, 0, 0
 
 
-def _has_budget_in_file(budget_file: Path, limit: int, reserve: int = 0) -> Tuple[bool, int, str]:
-    """Проверяет остаток бюджета без списания."""
+def _read_budget_calls(budget_file: Path, today: str) -> int:
+    """Читает общее число израсходованных вызовов за указанную дату UTC из файла бюджета."""
+    calls, _entry, _reaudit = _read_budget_state(budget_file, today)
+    return calls
+
+
+def _has_budget_in_file(
+    budget_file: Path, limit: int, reserve: int = 0, total_reserve: int = 0
+) -> Tuple[bool, int, str]:
+    """Проверяет остаток раздельного бюджета (входы vs реаудиты) без списания."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    calls = _read_budget_calls(budget_file, today)
-    return (calls < limit - reserve), calls, today
+    eff_reserve = total_reserve if total_reserve > 0 else max(0, reserve)
+    calls, entry_calls, reaudit_calls = _read_budget_state(budget_file, today, total_reserve=eff_reserve)
+    if reserve > 0:
+        entry_limit = max(0, limit - reserve)
+        return (calls < limit and entry_calls < entry_limit), entry_calls, today
+    reaudit_limit = eff_reserve if eff_reserve > 0 else limit
+    return (calls < limit and reaudit_calls < reaudit_limit), calls, today
 
 
-def _consume_budget_in_file(budget_file: Path, limit: int, reserve: int = 0) -> Tuple[bool, int, str]:
-    """Атомарно списывает один вызов из указанного файла бюджета."""
+def _consume_budget_in_file(
+    budget_file: Path, limit: int, reserve: int = 0, total_reserve: int = 0
+) -> Tuple[bool, int, str]:
+    """Атомарно списывает один вызов из раздельного пула (entry_calls или reaudit_calls)."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    budget: Dict[str, Any] = {}
-    if budget_file.exists():
-        try:
-            budget = json.loads(budget_file.read_text(encoding="utf-8"))
-        except Exception:
-            budget = {}
-    if budget.get("date") != today:
-        budget = {"date": today, "calls": 0}
-    calls = int(budget.get("calls", 0))
-    if calls >= limit - reserve:
-        return False, calls, today
-    budget["calls"] = calls + 1
+    eff_reserve = total_reserve if total_reserve > 0 else max(0, reserve)
+    calls, entry_calls, reaudit_calls = _read_budget_state(budget_file, today, total_reserve=eff_reserve)
+    if reserve > 0:
+        entry_limit = max(0, limit - reserve)
+        if calls >= limit or entry_calls >= entry_limit:
+            return False, entry_calls, today
+        entry_calls += 1
+    else:
+        reaudit_limit = eff_reserve if eff_reserve > 0 else limit
+        if calls >= limit or reaudit_calls >= reaudit_limit:
+            return False, calls, today
+        reaudit_calls += 1
+    calls = entry_calls + reaudit_calls
+    budget = {
+        "date": today,
+        "calls": calls,
+        "entry_calls": entry_calls,
+        "reaudit_calls": reaudit_calls,
+    }
     atomic_write_json(budget_file, budget)
-    return True, int(budget["calls"]), today
+    return True, (entry_calls if reserve > 0 else calls), today
 
 
 def _backup_has_capacity(reserve: int = 0) -> bool:
@@ -412,14 +463,22 @@ def _backup_has_capacity(reserve: int = 0) -> bool:
     if not load_commandcode_api_key():
         return False
     ok, _calls, _today = _has_budget_in_file(
-        AI_BACKUP_BUDGET_FILE, BACKUP_MAX_AI_CALLS_PER_DAY, reserve
+        AI_BACKUP_BUDGET_FILE,
+        BACKUP_MAX_AI_CALLS_PER_DAY,
+        reserve,
+        total_reserve=BACKUP_REAUDIT_RESERVE_CALLS,
     )
     return ok
 
 
 def _consume_ai_call_budget(reserve: int = 0) -> bool:
-    """Учитывает платный вызов Venice в суточном лимите. False — лимит на сегодня исчерпан."""
-    ok, calls, today = _consume_budget_in_file(AI_BUDGET_FILE, MAX_AI_CALLS_PER_DAY, reserve)
+    """Учитывает платный вызов Venice в раздельном суточном лимите. False — лимит на сегодня исчерпан."""
+    ok, calls, today = _consume_budget_in_file(
+        AI_BUDGET_FILE,
+        MAX_AI_CALLS_PER_DAY,
+        reserve,
+        total_reserve=REAUDIT_RESERVE_CALLS,
+    )
     if not ok:
         backup_reserve = BACKUP_REAUDIT_RESERVE_CALLS if reserve > 0 else 0
         if _backup_has_capacity(backup_reserve):
@@ -434,7 +493,10 @@ def _consume_ai_call_budget(reserve: int = 0) -> bool:
 def _consume_backup_ai_call_budget(reserve: int = 0) -> bool:
     """Учитывает платный вызов резервного Command Code в его отдельном суточном лимите."""
     ok, calls, today = _consume_budget_in_file(
-        AI_BACKUP_BUDGET_FILE, BACKUP_MAX_AI_CALLS_PER_DAY, reserve
+        AI_BACKUP_BUDGET_FILE,
+        BACKUP_MAX_AI_CALLS_PER_DAY,
+        reserve,
+        total_reserve=BACKUP_REAUDIT_RESERVE_CALLS,
     )
     if not ok:
         _notify_budget_limit_once("backup_entry" if reserve > 0 else "backup_full", today, calls)
@@ -443,21 +505,36 @@ def _consume_backup_ai_call_budget(reserve: int = 0) -> bool:
 
 
 def get_ai_budget() -> Dict[str, Any]:
-    """Сколько платных вызовов Venice сделано сегодня (UTC) и каков лимит."""
+    """Сколько платных вызовов Venice сделано сегодня (UTC) по пулам входов и реаудитов."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    calls = _read_budget_calls(AI_BUDGET_FILE, today)
-    return {"date": today, "calls": calls, "limit": MAX_AI_CALLS_PER_DAY, "reserve": REAUDIT_RESERVE_CALLS}
+    calls, entry_calls, reaudit_calls = _read_budget_state(
+        AI_BUDGET_FILE, today, total_reserve=REAUDIT_RESERVE_CALLS
+    )
+    return {
+        "date": today,
+        "calls": calls,
+        "entry_calls": entry_calls,
+        "reaudit_calls": reaudit_calls,
+        "limit": MAX_AI_CALLS_PER_DAY,
+        "entry_limit": max(0, MAX_AI_CALLS_PER_DAY - REAUDIT_RESERVE_CALLS),
+        "reserve": REAUDIT_RESERVE_CALLS,
+    }
 
 
 def get_backup_ai_budget() -> Dict[str, Any]:
     """Статус, модели и расход резервного провайдера Command Code на сегодня (UTC)."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    calls = _read_budget_calls(AI_BACKUP_BUDGET_FILE, today)
+    calls, entry_calls, reaudit_calls = _read_budget_state(
+        AI_BACKUP_BUDGET_FILE, today, total_reserve=BACKUP_REAUDIT_RESERVE_CALLS
+    )
     return {
         "enabled": bool(load_commandcode_api_key()),
         "date": today,
         "calls": calls,
+        "entry_calls": entry_calls,
+        "reaudit_calls": reaudit_calls,
         "limit": BACKUP_MAX_AI_CALLS_PER_DAY,
+        "entry_limit": max(0, BACKUP_MAX_AI_CALLS_PER_DAY - BACKUP_REAUDIT_RESERVE_CALLS),
         "reserve": BACKUP_REAUDIT_RESERVE_CALLS,
         "models": get_commandcode_models(),
     }
@@ -466,16 +543,16 @@ def get_backup_ai_budget() -> Dict[str, Any]:
 def entry_budget_exhausted() -> bool:
     """True только когда лимиты на новые входы исчерпаны и в Venice, и в доступном резерве Command Code."""
     b = get_ai_budget()
-    if int(b["calls"]) < MAX_AI_CALLS_PER_DAY - REAUDIT_RESERVE_CALLS:
+    if int(b["entry_calls"]) < int(b["entry_limit"]) and int(b["calls"]) < int(b["limit"]):
         return False
     if load_commandcode_api_key():
         bb = get_backup_ai_budget()
-        if int(bb["calls"]) < BACKUP_MAX_AI_CALLS_PER_DAY - BACKUP_REAUDIT_RESERVE_CALLS:
-            _notify_budget_limit_once("venice_fallback_budget", b["date"], int(b["calls"]))
+        if int(bb["entry_calls"]) < int(bb["entry_limit"]) and int(bb["calls"]) < int(bb["limit"]):
+            _notify_budget_limit_once("venice_fallback_budget", b["date"], int(b["entry_calls"]))
             return False
-        _notify_budget_limit_once("backup_entry", bb["date"], int(bb["calls"]))
+        _notify_budget_limit_once("backup_entry", bb["date"], int(bb["entry_calls"]))
         return True
-    _notify_budget_limit_once("entry", b["date"], int(b["calls"]))
+    _notify_budget_limit_once("entry", b["date"], int(b["entry_calls"]))
     return True
 
 
@@ -565,7 +642,7 @@ def _build_audit_prompt(
             "- SKIP (confidence >= 75) ONLY if there is a concrete, high-conviction reason to EXIT EARLY right now:\n"
             f"  1. New breaking news or confirmed escalation directly threatens [{outcome_label}] and materially increases the chance it resolves against us.\n"
             f"  2. A newly confirmed imminent binary event creates an unacceptable gap risk straight past Stop-Loss ${stop_price:.4f}.\n\n"
-            f"Resolution rules:\n{description[:4000]}\n\n"
+            f"Resolution rules:\n{description[:REAUDIT_DESCRIPTION_MAX_CHARS]}\n\n"
             'Respond STRICTLY in valid JSON with NO markdown fences (write "summary" in Russian, 1-2 concise sentences):\n'
             '{"decision": "APPROVE" or "SKIP", "confidence": 0_to_100, '
             '"summary": "краткое обоснование на русском (1-2 предложения)", '
@@ -646,10 +723,11 @@ def _fetch_google_news_context(question: str, max_items: int = 6) -> str:
         return ""
 
 
-def _augment_prompt_with_news(prompt: str, question: str) -> str:
+def _augment_prompt_with_news(prompt: str, question: str, news_ctx: Optional[str] = None) -> str:
     """Дополняет промпт свежими заголовками Google News RSS для резервного провайдера без встроенного веб-поиска."""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    news_ctx = _fetch_google_news_context(question)
+    if news_ctx is None:
+        news_ctx = _fetch_google_news_context(question)
     if news_ctx:
         news_block = f"Live news headlines (Google News RSS, fetched {now_str} UTC):\n{news_ctx}\n\n"
     else:
@@ -804,6 +882,16 @@ def _commandcode_single_audit(prompt: str, api_key: str, base_url: str, model: s
     )
 
 
+def _order_consensus_models(models: List[str]) -> List[str]:
+    """Ставит более экономичную модель (Grok/Gemini) первым голосом в консенсусе 2/2, чтобы отсекать SKIP дешевле."""
+    def _cost_rank(m: str) -> int:
+        ml = m.lower()
+        if "grok" in ml or "gemini" in ml or "deepseek" in ml or "qwen" in ml:
+            return 0
+        return 1
+    return sorted(models, key=_cost_rank)
+
+
 def call_venice_market_audit(
     question: str,
     description: str,
@@ -816,10 +904,12 @@ def call_venice_market_audit(
     budget_reserve: int = 0,
     end_date: str = "",
     stop_loss_price: float = 0.0,
+    prefer_backup: bool = False,
 ) -> Dict[str, Any]:
     """Вызывает Venice AI (с автоматическим failover на резервный Command Code) для аудита рынка.
 
     samples > 1 — консенсус: APPROVE только если все выборки одобрили (сглаживает недетерминизм модели).
+    prefer_backup=True — для спокойных 24ч-реаудитов сначала использует резервный Command Code (экономя Venice под входы).
     При сбое обоих провайдеров или исчерпании обоих бюджетов строго соблюдается Fail-Closed (вход блокируется)."""
     global _venice_cooldown_until, _venice_cooldown_date
     cache_path = Path(cache_file) if cache_file else DEFAULT_AI_CACHE_FILE
@@ -832,21 +922,32 @@ def call_venice_market_audit(
 
     models = get_venice_models()
     req_models = [models[i % len(models)] for i in range(max(1, samples))]
+    if len(req_models) >= 2:
+        req_models = _order_consensus_models(req_models)
     web_mode = get_venice_web_search_mode()
 
     cache_key = f"{strategy_type}::{outcome_label}::{question[:120]}"
     now = time.time()
-    if cache_key in cache and now - cache[cache_key].get("ts", 0) < cache_ttl_sec:
+    if cache_key in cache and cache_ttl_sec > 0:
         cached = cache[cache_key].get("result") or {}
-        cached_models = cached.get("models_requested") or (
-            [cached.get("model_requested")] if cached.get("model_requested") else []
-        )
-        if (
-            cached_models == req_models
-            and cached.get("web_search") == web_mode
-            and cached.get("prompt_ver") == AUDIT_PROMPT_VERSION
-        ):
-            return cached
+        eff_ttl = cache_ttl_sec
+        if strategy_type == "polymarket_smart_bonding" and cached.get("decision") == "SKIP":
+            conf = int(cached.get("confidence") or 0)
+            eff_ttl = max(
+                cache_ttl_sec,
+                ENTRY_HIGH_SKIP_CACHE_TTL_SEC if conf >= 80 else ENTRY_SKIP_CACHE_TTL_SEC,
+            )
+        if now - float(cache[cache_key].get("ts", 0)) < eff_ttl:
+            cached_models = cached.get("models_requested") or (
+                [cached.get("model_requested")] if cached.get("model_requested") else []
+            )
+            if (
+                len(cached_models) == len(req_models)
+                and set(cached_models).issubset(set(models))
+                and cached.get("web_search") == web_mode
+                and cached.get("prompt_ver") == AUDIT_PROMPT_VERSION
+            ):
+                return cached
 
     api_key = load_venice_api_key()
     backup_key = load_commandcode_api_key()
@@ -881,38 +982,74 @@ def call_venice_market_audit(
         venice_failed = False
         venice_billing_err = False
         venice_budget_out = False
+        cc_attempted = False
+        cc_failed = False
+        cc_billing_err = False
+        cc_budget_out = False
+        cc_reason = ""
 
-        venice_in_cooldown = _venice_cooldown_until > time.time()
-        if api_key and not venice_in_cooldown:
-            if _consume_ai_call_budget(budget_reserve):
+        # Гибридный режим (Option B): для спокойных плановых реаудитов сначала вызываем Command Code
+        if prefer_backup and backup_key and strategy_type != "polymarket_smart_bonding":
+            cc_attempted = True
+            if not backup_prompt:
+                news_ctx = _fetch_google_news_context(question)
+                backup_prompt = _augment_prompt_with_news(prompt, question, news_ctx=news_ctx)
+            cc_reserve = BACKUP_REAUDIT_RESERVE_CALLS if budget_reserve > 0 else 0
+            if _consume_backup_ai_call_budget(cc_reserve):
+                cc_model = get_commandcode_model_for_slot(vote_idx, vote_model)
                 try:
-                    vote = _venice_single_audit(prompt, api_key, base_url, vote_model)
-                    _venice_cooldown_until = 0.0
-                    _venice_cooldown_date = ""
-                except Exception as exc:
-                    venice_failed = True
-                    venice_reason = f"{vote_model}: {exc}"
-                    if any(code in venice_reason for code in ("HTTP 401:", "HTTP 402:")):
-                        venice_billing_err = True
-                        _venice_cooldown_until = time.time() + VENICE_BILLING_COOLDOWN_SEC
-                        _venice_cooldown_date = today
+                    vote = _commandcode_single_audit(backup_prompt, backup_key, backup_base_url, cc_model)
+                except Exception as cc_exc:
+                    cc_failed = True
+                    cc_reason = f"{cc_model}: {cc_exc}"
+                    cc_billing_err = any(code in cc_reason for code in ("HTTP 401:", "HTTP 402:"))
             else:
-                venice_budget_out = True
-                venice_reason = "исчерпан суточный лимит Venice"
-        elif not api_key:
-            venice_failed = True
-            venice_reason = "VENICE_API_KEY отсутствует"
-        else:
-            venice_failed = True
-            venice_billing_err = True
-            venice_reason = "Venice на 15-мин паузе после ошибки биллинга (401/402)"
+                cc_budget_out = True
+                cc_reason = "лимит резервного Command Code исчерпан"
 
         if vote is None:
-            if backup_key:
+            venice_in_cooldown = _venice_cooldown_until > time.time()
+            if api_key and not venice_in_cooldown:
+                if _consume_ai_call_budget(budget_reserve):
+                    try:
+                        vote = _venice_single_audit(prompt, api_key, base_url, vote_model)
+                        _venice_cooldown_until = 0.0
+                        _venice_cooldown_date = ""
+                    except Exception as exc:
+                        venice_failed = True
+                        venice_reason = f"{vote_model}: {exc}"
+                        if any(code in venice_reason for code in ("HTTP 401:", "HTTP 402:")):
+                            venice_billing_err = True
+                            _venice_cooldown_until = time.time() + VENICE_BILLING_COOLDOWN_SEC
+                            _venice_cooldown_date = today
+                else:
+                    venice_budget_out = True
+                    venice_reason = "исчерпан суточный лимит Venice"
+            elif not api_key:
+                venice_failed = True
+                venice_reason = "VENICE_API_KEY отсутствует"
+            else:
+                venice_failed = True
+                venice_billing_err = True
+                venice_reason = "Venice на 15-мин паузе после ошибки биллинга (401/402)"
+
+        if vote is None:
+            if backup_key and not cc_attempted:
+                if not backup_prompt:
+                    news_ctx = _fetch_google_news_context(question)
+                    if not news_ctx and strategy_type == "polymarket_smart_bonding":
+                        return {
+                            "decision": "SKIP",
+                            "raw_decision": "SKIP",
+                            "confidence": 0,
+                            "summary": "Резервный провайдер [cc]: в Google News RSS нет свежих заголовков по теме, вход вслепую без веб-поиска Venice заблокирован.",
+                            "watch_keywords": [],
+                            "emergency_mode": False,
+                            "model_used": "none (cc-no-news)",
+                        }
+                    backup_prompt = _augment_prompt_with_news(prompt, question, news_ctx=news_ctx)
                 cc_reserve = BACKUP_REAUDIT_RESERVE_CALLS if budget_reserve > 0 else 0
                 if _consume_backup_ai_call_budget(cc_reserve):
-                    if not backup_prompt:
-                        backup_prompt = _augment_prompt_with_news(prompt, question)
                     cc_model = get_commandcode_model_for_slot(vote_idx, vote_model)
                     try:
                         vote = _commandcode_single_audit(backup_prompt, backup_key, backup_base_url, cc_model)
@@ -967,6 +1104,38 @@ def call_venice_market_audit(
                         "budget_exhausted": True,
                         "model_used": "none (budget)",
                     }
+            elif cc_attempted:
+                if venice_budget_out and cc_budget_out:
+                    summary = (
+                        "Суточные лимиты Venice и резервного Command Code на новые входы исчерпаны до 00:00 UTC."
+                        if budget_reserve else
+                        "Полные суточные лимиты Venice и резервного Command Code исчерпаны до 00:00 UTC."
+                    )
+                    return {
+                        "decision": "SKIP",
+                        "confidence": 0,
+                        "summary": summary,
+                        "watch_keywords": [],
+                        "emergency_mode": False,
+                        "budget_exhausted": True,
+                        "model_used": "none (budget)",
+                    }
+                last_err = f"CommandCode({cc_reason}); Venice({venice_reason})"
+                update_ai_health(success=False, error=last_err, latency=0.0)
+                if venice_billing_err or cc_billing_err:
+                    daemon_alerts.problem(
+                        "venice_billing",
+                        "Venice и резервный Command Code отклонили запрос (биллинг/ключ)",
+                        last_err,
+                        immediate=True,
+                    )
+                else:
+                    daemon_alerts.problem(
+                        "venice_audit",
+                        "сбой аудита Command Code и Venice",
+                        last_err,
+                    )
+                break
             else:
                 if venice_budget_out:
                     summary = (

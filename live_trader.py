@@ -85,9 +85,13 @@ MIN_NET_RETURN_PCT = 0.30         # Минимальная чистая дохо
 DUST_SHARES_THRESHOLD = 0.01      # Неторгуемая комиссионная «пыль» < 0.01 акции после полного SELL
 ENTRY_AI_SAMPLES = 2              # Вход только при двух независимых APPROVE от модели
 MAX_FRESH_AUDITS_PER_TICK = 2     # Ограничение свежих (не кэшированных) аудитов за один тик
-ENTRY_AUDIT_CACHE_TTL_SEC = 21600.0  # 6 часов кэша для аудитов входа (экономия DIEM с веб-поиском)
-REAUDIT_INTERVAL_SEC = 21600.0    # 6 часов между плановыми реаудитами
-REAUDIT_RECHECK_SEC = 3600.0      # Перепроверка через час после первого SKIP
+ENTRY_AUDIT_CACHE_TTL_SEC = 21600.0  # 6 часов кэша для APPROVE на входе (SKIP кэшируется на 24-36 ч)
+REAUDIT_CALM_INTERVAL_SEC = 86400.0  # 24 часа между реаудитами спокойных позиций (просадка < 1¢, срок > 3 дн.)
+REAUDIT_INTERVAL_SEC = 21600.0    # 6 часов между реаудитами настороженных позиций (просадка 1-2¢ или срок <= 3 дн.)
+REAUDIT_RECHECK_SEC = 3600.0      # 1 час для позиций под давлением (просадка >= 2¢ или после первого SKIP)
+REAUDIT_WATCH_DROP = 0.0100       # Просадка от цены входа >= 1.0¢ переводит реаудит в 6-часовой режим на Venice
+REAUDIT_STRESS_DROP = 0.0200      # Просадка от цены входа >= 2.0¢ переводит реаудит в 1-часовой режим на Venice
+REAUDIT_NEAR_EXPIRY_DAYS = 3.0    # Менее 3 суток до экспирации -> проверяем каждые 6 ч на Venice
 REOPEN_COOLDOWN_SEC = 12 * 3600.0 # Пауза перед повторным входом в закрытый рынок
 MISSING_BUY_CONFIRM_SEC = 90.0    # Две сверки исчезнувшей заявки в разных циклах
 MISSING_BUY_MAX_GAP_SEC = 360.0
@@ -95,6 +99,11 @@ SELL_REPLACE_AFTER_SEC = 60.0     # Незаполненный Stop-Loss SELL п
 SELL_AGGRESSIVE_TICKS = 1         # На сколько тиков ниже best_bid ставить SELL для выкупа
 REAUDIT_EXIT_MIN_CONFIDENCE = 75  # Досрочный выход по реаудиту только при явном SKIP с уверенностью >= 75%
 FAST_GUARD_INTERVAL_SEC = 20      # Быстрая проверка стаканов и Stop-Loss открытых позиций каждые 20 с
+MIN_ENTRY_BID_DEPTH_USD = 250.0   # Мин. живая глубина бидов в пределах 2¢ от best_bid для входа ($)
+BID_DEPTH_BAND = 0.0200           # Ширина полосы от best_bid для оценки ликвидности стакана на выход (2.0¢)
+STOP_LOSS_CONFIRM_STREAK = 2      # Число последовательных проверок ниже стопа для защиты от секундных проколов
+STOP_LOSS_MAX_HOLE_SPREAD = 0.0300  # Спред > 3.0¢ при mid >= stop_px считается дыркой в стакане, а не обвалом
+STOP_LOSS_PANIC_OFFSET = 0.0300   # Глубокий обвал (bid <= stop - 3¢ и ask <= stop + 0.5¢) -> выход с 1-го замера
 
 TOPIC_CLUSTER_PATTERNS = {
     "iran_mideast": re.compile(
@@ -130,6 +139,44 @@ def pos_stop_loss_price(pos: Dict[str, Any]) -> float:
     if base <= 0:
         return BOND_STOP_LOSS
     return round(max(BOND_STOP_LOSS_FLOOR, base - BOND_STOP_LOSS_OFFSET), 4)
+
+
+def compute_reaudit_plan(
+    pos: Dict[str, Any],
+    market: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+) -> Tuple[float, bool, str]:
+    """Вычисляет (интервал_сек, prefer_backup, режим) для адаптивного реаудита открытой позиции.
+
+    - 'stressed' (есть страйк SKIP или просадка >= 2.0¢ от входа): 1 ч на Venice (веб-поиск).
+    - 'watch' (просадка 1.0–2.0¢ или до экспирации <= 3 дн.): 6 ч на Venice (веб-поиск).
+    - 'calm' (просадка < 1.0¢, 0 страйков, до экспирации > 3 дн.): 24 ч через Command Code (экономя Venice)."""
+    cur_now = float(now if now is not None else time.time())
+    streak = int(pos.get("ai_skip_streak", 0))
+    entry_price = float(pos.get("entry_price") or pos.get("requested_price") or 0.0)
+    current_price = float(pos.get("current_price") or entry_price)
+    drop = max(0.0, round(entry_price - current_price, 6)) if entry_price > 0 else 0.0
+
+    days_left = 14.0
+    end_str = str((market or {}).get("endDate") or pos.get("end_date") or "").strip()
+    if end_str:
+        try:
+            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            end_dt = end_dt if end_dt.tzinfo else end_dt.replace(tzinfo=timezone.utc)
+            days_left = max(0.0, (end_dt.timestamp() - cur_now) / 86400.0)
+        except ValueError:
+            pass
+    elif pos.get("days_left") is not None:
+        try:
+            days_left = max(0.0, float(pos["days_left"]))
+        except (TypeError, ValueError):
+            pass
+
+    if streak > 0 or drop >= REAUDIT_STRESS_DROP:
+        return REAUDIT_RECHECK_SEC, False, "stressed"
+    if drop >= REAUDIT_WATCH_DROP or days_left <= REAUDIT_NEAR_EXPIRY_DAYS:
+        return REAUDIT_INTERVAL_SEC, False, "watch"
+    return REAUDIT_CALM_INTERVAL_SEC, True, "calm"
 
 
 def _position_topic_clusters(text: str) -> Set[str]:
@@ -420,16 +467,73 @@ def _parse_book_summary(book: Optional[Dict[str, Any]]) -> Optional[Dict[str, An
         [(float(a["price"]), float(a["size"])) for a in (book.get("asks") or []) if float(a.get("size", 0)) > 0],
         key=lambda x: x[0],
     )
+    best_bid = bids[0][0] if bids else None
+    near_bid_depth_usd = (
+        round(sum(p * s for p, s in bids if p >= best_bid - BID_DEPTH_BAND - 1e-9), 2)
+        if best_bid is not None
+        else 0.0
+    )
     return {
         "bids": bids,
         "asks": asks,
-        "best_bid": bids[0][0] if bids else None,
+        "best_bid": best_bid,
         "best_bid_size": bids[0][1] if bids else 0.0,
+        "near_bid_depth_usd": near_bid_depth_usd,
         "best_ask": asks[0][0] if asks else None,
         "best_ask_size": asks[0][1] if asks else 0.0,
         "tick_size": str(book.get("tick_size") or "0.01"),
         "min_order_size": float(book.get("min_order_size") or 5.0),
     }
+
+
+def should_trigger_stop_loss(
+    pos: Dict[str, Any], summary: Dict[str, Any], stop_px: float
+) -> Tuple[bool, str]:
+    """Проверяет пробой Stop-Loss с защитой от одиночных ночных проколов пустого стакана."""
+    if not summary or summary.get("best_bid") is None:
+        return False, ""
+    bid = float(summary["best_bid"])
+    if bid >= stop_px:
+        pos.pop("stop_breach_streak", None)
+        return False, ""
+
+    # Если защитный SELL уже выставлен и не завершён — продолжаем его сопровождение без задержки
+    if any(not x.get("complete") for x in pos.get("exit_orders", [])):
+        return True, f"лучший bid ${bid:.4f} ниже стопа ${stop_px:.4f} (-3.5¢)"
+
+    ask = float(summary["best_ask"]) if summary.get("best_ask") is not None else bid
+    spread = ask - bid
+    mid = (bid + ask) / 2.0
+
+    # Если аск остался высоко (mid >= stop_px), а спред разъехался > 3¢ — это дырка в бидах, а не обвал
+    if spread > STOP_LOSS_MAX_HOLE_SPREAD and mid >= stop_px:
+        now = time.time()
+        if now - float(pos.get("last_hole_log_at") or 0.0) >= 300.0:
+            pos["last_hole_log_at"] = now
+            log_live_event(
+                f"🛡 Игнорируем прокол пустого стакана {pos.get('title', '')[:38]}: "
+                f"bid=${bid:.4f} < SL=${stop_px:.4f}, но ask=${ask:.4f} (mid=${mid:.4f}, спред {spread*100:.1f}¢)"
+            )
+        return False, ""
+
+    # Экстренный обвал всего стакана (и bid, и ask глубоко под стопом) — выходим сразу с 1-го замера
+    if bid <= stop_px - STOP_LOSS_PANIC_OFFSET and ask <= stop_px + 0.005:
+        pos["stop_breach_streak"] = STOP_LOSS_CONFIRM_STREAK
+        return True, f"экстренный пробой стопа: bid ${bid:.4f} / ask ${ask:.4f} ниже ${stop_px:.4f}"
+
+    streak = int(pos.get("stop_breach_streak") or 0) + 1
+    pos["stop_breach_streak"] = streak
+    if streak < STOP_LOSS_CONFIRM_STREAK:
+        log_live_event(
+            f"⏳ Пробой стопа {pos.get('title', '')[:38]} ({streak}/{STOP_LOSS_CONFIRM_STREAK}): "
+            f"bid=${bid:.4f} < SL=${stop_px:.4f} (ask=${ask:.4f}), ждём подтверждения..."
+        )
+        return False, ""
+
+    return (
+        True,
+        f"лучший bid ${bid:.4f} ниже стопа ${stop_px:.4f} (-3.5¢, подтв. {streak}/{STOP_LOSS_CONFIRM_STREAK})",
+    )
 
 
 def _round_price_to_tick(price: float, tick_size_str: str) -> Decimal:
@@ -844,6 +948,11 @@ def execute_buy_bond(secure_client: SecureClient, candidate: Dict[str, Any], slo
     if bid is None or (ask - float(bid)) > MAX_ENTRY_SPREAD:
         log_live_event("⚠️ Новый вход пропущен: спред стакана шире 1.5¢ или отсутствует bid.")
         return None
+    if float(summary.get("near_bid_depth_usd") or 0.0) < MIN_ENTRY_BID_DEPTH_USD:
+        log_live_event(
+            f"⚠️ Новый вход пропущен: тонкий стакан на покупку (${float(summary.get('near_bid_depth_usd') or 0.0):.0f} < ${MIN_ENTRY_BID_DEPTH_USD:.0f})."
+        )
+        return None
     price = _round_price_to_tick(ask, summary["tick_size"])
     shares = math.floor(slot_size / float(price) * 100) / 100
     if shares < summary["min_order_size"] or shares <= 0:
@@ -1172,11 +1281,12 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                     ask = float(summary["best_ask"]) if summary["best_ask"] is not None else bid
                     pos["current_price"] = round((bid + ask) / 2, 4)
                     pos["unrealized_pnl_usd"] = round(shares * (pos["current_price"] - entry_price), 6)
+                    trigger_sl, sl_reason = should_trigger_stop_loss(pos, summary, stop_px)
                     save_live_state(state)
-                    if bid < stop_px:
+                    if trigger_sl:
                         finished = find_market_for_pos(pos, [])
                         if not finished or not market_trading_finished(finished):
-                            execute_sell_bond(secure_client, pos, f"лучший bid ${bid:.4f} ниже стопа ${stop_px:.4f} (-3.5¢)", state)
+                            execute_sell_bond(secure_client, pos, sl_reason, state)
                             continue
                 else:
                     log_live_event(f"⚠️ Нет bid для {pos['title'][:40]}; позиция не считается закрытой.")
@@ -1207,13 +1317,14 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                 if not m or market_trading_finished(m) or shares <= 0 or pending_exit:
                     continue
                 streak = int(pos.get("ai_skip_streak", 0))
-                interval = REAUDIT_INTERVAL_SEC if streak == 0 else REAUDIT_RECHECK_SEC
+                interval, prefer_cc, _reaudit_tier = compute_reaudit_plan(pos, m, now)
                 if now - float(pos.get("last_audit_ts", 0)) >= interval:
                     audit = call_venice_market_audit(
                         question=pos.get("question") or pos["title"].split(" [")[0],
                         description=m.get("description", ""), price_yes=float(pos.get("current_price", entry_price)),
                         strategy_type="polymarket_smart_bonding_reaudit", outcome_label=pos.get("outcome", "Yes"),
-                        cache_ttl_sec=interval, end_date=m.get("endDate", ""), stop_loss_price=stop_px)
+                        cache_ttl_sec=interval, end_date=m.get("endDate", ""), stop_loss_price=stop_px,
+                        prefer_backup=prefer_cc)
                     audited_at = float(audit.get("audited_at") or 0)
                     if audited_at and audited_at != float(pos.get("last_audit_ts", 0)):
                         raw_dec = str(audit.get("raw_decision") or audit.get("decision") or "").upper()
@@ -1353,6 +1464,8 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                 continue
             if (best_ask - best_bid) > MAX_ENTRY_SPREAD:
                 continue
+            if float(summary.get("near_bid_depth_usd") or 0.0) < MIN_ENTRY_BID_DEPTH_USD:
+                continue
 
             # Пересчитываем чистую доходность и APR по реальному best_ask за вычетом комиссии
             est_gross_shares = slot_size / best_ask
@@ -1468,17 +1581,23 @@ def run_fast_stop_guard(cfg: Dict[str, str]) -> None:
                     ask = float(summary["best_ask"]) if summary["best_ask"] is not None else bid
                     new_cur = round((bid + ask) / 2, 4)
                     new_upnl = round(shares * (new_cur - entry_price), 6)
-                    if pos.get("current_price") != new_cur or pos.get("unrealized_pnl_usd") != new_upnl:
+                    prev_streak = pos.get("stop_breach_streak")
+                    trigger_sl, sl_reason = should_trigger_stop_loss(pos, summary, stop_px)
+                    if (
+                        pos.get("current_price") != new_cur
+                        or pos.get("unrealized_pnl_usd") != new_upnl
+                        or pos.get("stop_breach_streak") != prev_streak
+                    ):
                         pos["current_price"] = new_cur
                         pos["unrealized_pnl_usd"] = new_upnl
                         state_changed = True
-                    if bid < stop_px:
+                    if trigger_sl:
                         finished = find_market_for_pos(pos, [])
                         if not finished or not market_trading_finished(finished):
                             execute_sell_bond(
                                 _client(),
                                 pos,
-                                f"лучший bid ${bid:.4f} ниже стопа ${stop_px:.4f} (-3.5¢)",
+                                sl_reason,
                                 state,
                             )
                             state_changed = True
