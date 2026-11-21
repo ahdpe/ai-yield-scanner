@@ -409,17 +409,43 @@ def estimate_taker_fee_usd(
     return round(fee, 5)
 
 
+BOND_MIN_ENTRY_APR = 35.0          # Минимальный чистый APR (%) для Smart Bonding (отсекает 12-22% 41-дневные слоты)
+BOND_MIN_RISK_SCORE = 80           # Минимальная эвристическая оценка безопасности рынка (0..100)
+BOND_MAX_1H_CHANGE_CENTS = 1.0     # Отсекаем «падающие ножи»: сдвиг цены >= 1.0¢ за последний час
+BOND_MAX_24H_CHANGE_CENTS = 2.5    # Отсекаем повышенную суточную волатильность: сдвиг >= 2.5¢ за 24 ч
+
+
+def extract_event_id(market: Optional[Dict[str, Any]]) -> str:
+    """Возвращает единый ID родительского события Gamma API для авто-дедупликации."""
+    if not isinstance(market, dict):
+        return ""
+    events = market.get("events")
+    if isinstance(events, list) and events:
+        first = events[0]
+        if isinstance(first, dict) and first.get("id") is not None:
+            return str(first["id"]).strip()
+    return ""
+
+
 def scan_smart_bonding(
     markets: List[Dict[str, Any]],
     deposit_usd: float = 1000.0,
+    min_apr: float = BOND_MIN_ENTRY_APR,
 ) -> List[Dict[str, Any]]:
-    """Находит рынки с высокой вероятностью исхода (94.5¢ - 98.5¢, ≤ 45 дн.) для стратегии ИИ-бондинга."""
+    """Находит качественные рынки Smart Bonding (94.5¢–98.5¢, ≤ 45 дн., APR ≥ 35%, низкая волатильность)."""
     now = datetime.now(timezone.utc)
     candidates: List[Dict[str, Any]] = []
 
     for m in markets:
         risk_info = classify_polymarket_risk(m)
         if risk_info["is_sports"] or risk_info.get("is_crypto_price_target"):
+            continue
+        if int(risk_info.get("score") or 0) < BOND_MIN_RISK_SCORE:
+            continue
+        if (
+            float(risk_info.get("hr_change_cents") or 0.0) >= BOND_MAX_1H_CHANGE_CENTS
+            or float(risk_info.get("day_change_cents") or 0.0) >= BOND_MAX_24H_CHANGE_CENTS
+        ):
             continue
 
         book_liq = float(m.get("liquidityClob") or m.get("liquidity") or 0.0)
@@ -462,15 +488,23 @@ def scan_smart_bonding(
         if net_return_pct <= 0.3:
             continue
         annualized_apr = net_return_pct * (365.0 / days_left)
+        if annualized_apr < min_apr:
+            continue
+
+        apr_capped = min(annualized_apr, 150.0)
+        liq_factor = math.log10(max(book_liq, 10000.0))
+        quality_score = apr_capped * (float(risk_info["score"]) / 100.0) * liq_factor
 
         candidates.append({
             "question": m.get("question", ""),
             "slug": m.get("slug", ""),
+            "event_id": extract_event_id(m),
             "lead_outcome": lead_outcome,
             "entry_price": lead_price,
             "net_return_pct": net_return_pct,
             "days_left": days_left,
             "annualized_apr": annualized_apr,
+            "quality_score": round(quality_score, 2),
             "profit_usd": profit_usd,
             "book_liquidity_usd": book_liq,
             "end_date": end_str,
@@ -482,5 +516,5 @@ def scan_smart_bonding(
             "description": (m.get("description") or "")[:300],
         })
 
-    candidates.sort(key=lambda x: x["annualized_apr"], reverse=True)
+    candidates.sort(key=lambda x: x["quality_score"], reverse=True)
     return candidates

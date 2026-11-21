@@ -33,7 +33,9 @@ from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
 from ai_analyzer import REAUDIT_RESERVE_CALLS, call_venice_market_audit, entry_budget_exhausted
 from error_alerts import daemon_alerts
 from polymarket_scanner import (
+    BOND_MIN_ENTRY_APR,
     estimate_taker_fee_usd,
+    extract_event_id,
     fetch_clob_book,
     fetch_market_by_slug,
     fetch_polymarket_markets,
@@ -104,6 +106,14 @@ BID_DEPTH_BAND = 0.0200           # Ширина полосы от best_bid дл
 STOP_LOSS_CONFIRM_STREAK = 2      # Число последовательных проверок ниже стопа для защиты от секундных проколов
 STOP_LOSS_MAX_HOLE_SPREAD = 0.0300  # Спред > 3.0¢ при mid >= stop_px считается дыркой в стакане, а не обвалом
 STOP_LOSS_PANIC_OFFSET = 0.0300   # Глубокий обвал (bid <= stop - 3¢ и ask <= stop + 0.5¢) -> выход с 1-го замера
+LONG_HORIZON_DAYS = 21.0              # Позиции со сроком > 21 дн. считаются длинными
+MAX_LONG_HORIZON_SHARE = 0.40         # Макс. доля длинных слотов (> 21 дн.) от max_slots (40%)
+TAKE_PROFIT_MIN_DAYS_LEFT = 10.0      # Досрочный Take-Profit только если до экспирации >= 10 дн.
+TAKE_PROFIT_MAX_REM_APR = 20.0        # Take-Profit когда оставшийся APR к $1.00 упал ниже 20%
+TAKE_PROFIT_MIN_GAIN_CENTS = 0.0180   # Минимальный рост bid от входа (+1.8¢) для ротации
+TAKE_PROFIT_HIGH_BID = 0.9880         # Или достижение bid >= $0.988 с чистой прибылью после комиссий
+TAKE_PROFIT_MIN_NET_PROFIT_USD = 0.20 # Минимальная чистая прибыль ($) после комиссии SELL
+TAKE_PROFIT_MIN_NET_GAIN_PER_SHARE = 0.0030  # Минимум +0.3¢/акция чистыми после комиссии
 
 TOPIC_CLUSTER_PATTERNS = {
     "iran_mideast": re.compile(
@@ -141,6 +151,107 @@ def pos_stop_loss_price(pos: Dict[str, Any]) -> float:
     return round(max(BOND_STOP_LOSS_FLOOR, base - BOND_STOP_LOSS_OFFSET), 4)
 
 
+def _days_left_from_end_date(end_str: str, now: Optional[float] = None) -> Optional[float]:
+    """Возвращает число дней до даты экспирации ISO или None, если дата отсутствует/невалидна."""
+    clean = str(end_str or "").strip()
+    if not clean:
+        return None
+    cur_now = float(now if now is not None else time.time())
+    try:
+        end_dt = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (end_dt.timestamp() - cur_now) / 86400.0)
+
+
+def get_entry_tier_requirements(open_count: int, max_slots: int) -> Dict[str, Any]:
+    """Лестница строгости входа по заполненности слотов (сохраняет резерв 20% под топ-перекосы)."""
+    fill_ratio = float(open_count) / float(max(1, max_slots))
+    if fill_ratio < 0.50:
+        return {"tier": "core", "min_apr": 35.0, "max_days": 45.0, "min_confidence": 75}
+    if fill_ratio < 0.80:
+        return {"tier": "selective", "min_apr": 50.0, "max_days": 21.0, "min_confidence": 80}
+    return {"tier": "reserve", "min_apr": 80.0, "max_days": 14.0, "min_confidence": 85}
+
+
+def should_trigger_take_profit(
+    pos: Dict[str, Any],
+    summary: Dict[str, Any],
+    market: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+) -> Tuple[bool, str, float]:
+    """Проверяет досрочную фиксацию прибыли (Take-Profit) для освобождения длинного слота.
+
+    Учитывает комиссию SELL и глубину бидов стакана; при неизвестном расписании комиссий не срабатывает."""
+    if pos.get("status") != "OPEN" or not pos.get("entry_terminal"):
+        return False, "", 0.0
+    if any(not x.get("complete") for x in pos.get("exit_orders", [])):
+        return False, "", 0.0
+    if not summary or summary.get("best_bid") is None:
+        return False, "", 0.0
+    best_bid = float(summary["best_bid"])
+    if best_bid <= 0:
+        return False, "", 0.0
+
+    shares = float(pos.get("shares") or 0.0)
+    min_order_size = float(summary.get("min_order_size") or 5.0)
+    if shares <= 0 or shares < min_order_size:
+        return False, "", 0.0
+
+    entry_price = float(pos.get("entry_price") or 0.0)
+    if entry_price <= 0 or best_bid <= entry_price:
+        return False, "", 0.0
+
+    end_str = str((market or {}).get("endDate") or pos.get("end_date") or "").strip()
+    days_left = _days_left_from_end_date(end_str, now)
+    if days_left is None or days_left < TAKE_PROFIT_MIN_DAYS_LEFT:
+        return False, "", 0.0
+
+    rem_apr = ((1.0 - best_bid) / best_bid) * 100.0 * (365.0 / days_left)
+    if rem_apr >= TAKE_PROFIT_MAX_REM_APR:
+        return False, "", 0.0
+    if (best_bid - entry_price) < TAKE_PROFIT_MIN_GAIN_CENTS and best_bid < TAKE_PROFIT_HIGH_BID:
+        return False, "", 0.0
+
+    fee_sched = pos.get("fee_schedule")
+    if not (isinstance(fee_sched, dict) and not fee_sched.get("unknown")):
+        fee_sched = parse_fee_schedule(market) if isinstance(market, dict) else None
+    if not isinstance(fee_sched, dict) or fee_sched.get("unknown"):
+        return False, "", 0.0
+
+    est_exit_fee = estimate_taker_fee_usd(shares, best_bid, fee_sched)
+    alloc = float(pos.get("allocated_usd") or (shares * entry_price))
+    if alloc <= 0:
+        return False, "", 0.0
+    net_proceeds = shares * best_bid - est_exit_fee
+    net_profit_usd = net_proceeds - alloc
+    net_gain_per_share = net_profit_usd / shares
+    if net_profit_usd < TAKE_PROFIT_MIN_NET_PROFIT_USD or net_gain_per_share < TAKE_PROFIT_MIN_NET_GAIN_PER_SHARE:
+        return False, "", 0.0
+
+    position_bid_usd = shares * best_bid
+    near_bid_depth = float(summary.get("near_bid_depth_usd") or 0.0)
+    best_bid_size = float(summary.get("best_bid_size") or 0.0)
+    if near_bid_depth < position_bid_usd or best_bid_size * best_bid < position_bid_usd * 0.5:
+        return False, "", 0.0
+
+    fee_per_share = est_exit_fee / shares
+    min_sell_price = round(
+        min(
+            best_bid,
+            max((alloc / shares) + fee_per_share + TAKE_PROFIT_MIN_NET_GAIN_PER_SHARE, best_bid - 0.002),
+        ),
+        4,
+    )
+    reason = (
+        f"Take-Profit: bid ${best_bid:.4f} (вход ${entry_price:.4f}, прибыль ~+${net_profit_usd:.2f}, "
+        f"ост. APR {rem_apr:.1f}% на {days_left:.0f} дн.)"
+    )
+    return True, reason, min_sell_price
+
+
 def compute_reaudit_plan(
     pos: Dict[str, Any],
     market: Optional[Dict[str, Any]] = None,
@@ -157,20 +268,15 @@ def compute_reaudit_plan(
     current_price = float(pos.get("current_price") or entry_price)
     drop = max(0.0, round(entry_price - current_price, 6)) if entry_price > 0 else 0.0
 
-    days_left = 14.0
     end_str = str((market or {}).get("endDate") or pos.get("end_date") or "").strip()
-    if end_str:
-        try:
-            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-            end_dt = end_dt if end_dt.tzinfo else end_dt.replace(tzinfo=timezone.utc)
-            days_left = max(0.0, (end_dt.timestamp() - cur_now) / 86400.0)
-        except ValueError:
-            pass
-    elif pos.get("days_left") is not None:
-        try:
-            days_left = max(0.0, float(pos["days_left"]))
-        except (TypeError, ValueError):
-            pass
+    days_left = _days_left_from_end_date(end_str, cur_now)
+    if days_left is None:
+        days_left = 14.0
+        if pos.get("days_left") is not None:
+            try:
+                days_left = max(0.0, float(pos["days_left"]))
+            except (TypeError, ValueError):
+                pass
 
     if streak > 0 or drop >= REAUDIT_STRESS_DROP:
         return REAUDIT_RECHECK_SEC, False, "stressed"
@@ -970,6 +1076,7 @@ def execute_buy_bond(secure_client: SecureClient, candidate: Dict[str, Any], slo
     pos = dict(id=f"live_bond_{token_id[:12]}_{time.time_ns()}", type="poly_bond", status="OPEN",
                opened_at=now, title=f"{candidate['question']} [{candidate['lead_outcome']}]",
                question=candidate["question"], slug=candidate.get("slug", ""),
+               event_id=candidate.get("event_id", ""), end_date=candidate.get("end_date", ""),
                outcome=candidate["lead_outcome"], token_id=token_id,
                fee_schedule=fee_sched,
                requested_shares=shares, requested_price=float(price), shares=0.0, allocated_usd=0.0,
@@ -1072,9 +1179,22 @@ def execute_buy_bond(secure_client: SecureClient, candidate: Dict[str, Any], slo
     return pos
 
 
-def execute_sell_bond(secure_client: SecureClient, pos: Dict[str, Any], reason: str,
-                      state: Dict[str, Any]) -> bool:
+def execute_sell_bond(
+    secure_client: SecureClient,
+    pos: Dict[str, Any],
+    reason: str,
+    state: Dict[str, Any],
+    min_sell_price: Optional[float] = None,
+) -> bool:
     """Не освобождает слот до подтверждения SELL и не «зависает» на незаполненной заявке."""
+    is_take_profit = min_sell_price is not None
+    if is_take_profit:
+        pos["exit_kind"] = "take_profit"
+        pos["take_profit_min_price"] = float(min_sell_price)
+    else:
+        pos.pop("take_profit_min_price", None)
+        pos["exit_kind"] = "protective"
+
     if not reconcile_position(secure_client, state, pos) or pos.get("status") != "OPEN":
         return False
 
@@ -1132,12 +1252,12 @@ def execute_sell_bond(secure_client: SecureClient, pos: Dict[str, Any], reason: 
                 log_live_event(f"⚠️ SELL ${old_price:.4f} ещё не отменён/не исполнен; новая заявка не отправлена.")
                 daemon_alerts.problem(
                     f"sell_requote_{pos.get('id', 'pos')}",
-                    f"Stop-Loss SELL не перевыставлен: {pos.get('title', '')[:35]}",
+                    f"SELL не перевыставлен: {pos.get('title', '')[:35]}",
                     f"стакан bid={best_bid:.4f}, заявка ${old_price:.4f}",
                     immediate=True,
                 )
                 return False
-            log_live_event(f"🔁 Stop-Loss SELL ${old_price:.4f} отменён.")
+            log_live_event(f"🔁 Незаполненный SELL ${old_price:.4f} отменён.")
 
         if pos.get("status") != "OPEN":
             return pos.get("status") == "CLOSED"
@@ -1163,9 +1283,17 @@ def execute_sell_bond(secure_client: SecureClient, pos: Dict[str, Any], reason: 
         log_live_event("⚠️ Остаток SELL равен нулю; позиция остаётся под наблюдением.")
         return False
 
-    # После отмены стакан мог сдвинуться: перечитываем bid и агрессивно ставим на 1 тик ниже.
+    # После отмены стакан мог сдвинуться: перечитываем bid.
+    # Защитный выход ставим агрессивно (-1 тик), Take-Profit — по текущему bid с проверкой min_sell_price.
     summary = _parse_book_summary(_safe_fetch_book(pos["token_id"]))
     if not summary or summary["best_bid"] is None or summary["best_bid"] <= 0:
+        if is_take_profit:
+            pos.pop("take_profit_min_price", None)
+            pos.pop("exit_kind", None)
+            pos.pop("close_reason", None)
+            save_live_state(state)
+            log_live_event("🟢 Take-Profit отменён: исчез bid в стакане, позиция остаётся в портфеле.")
+            return False
         log_live_event("⚠️ Нет доступного bid для защитной продажи после отмены; позиция под наблюдением.")
         daemon_alerts.problem(
             f"sell_blocked_{pos.get('id', 'pos')}",
@@ -1191,11 +1319,21 @@ def execute_sell_bond(secure_client: SecureClient, pos: Dict[str, Any], reason: 
             tick = Decimal("0.01")
     except InvalidOperation:
         tick = Decimal("0.01")
-    raw_price = Decimal(str(best_bid)) - tick * Decimal(SELL_AGGRESSIVE_TICKS)
+    aggressive_ticks = 0 if is_take_profit else SELL_AGGRESSIVE_TICKS
+    raw_price = Decimal(str(best_bid)) - tick * Decimal(aggressive_ticks)
     price = _round_price_to_tick(float(max(tick, raw_price)), summary["tick_size"])
+
+    if is_take_profit and float(price) + 1e-9 < float(min_sell_price):
+        log_live_event("🟢 Take-Profit отменён: bid опустился ниже минимальной прибыльной цены, позиция остаётся в портфеле.")
+        pos.pop("take_profit_min_price", None)
+        pos.pop("exit_kind", None)
+        pos.pop("close_reason", None)
+        save_live_state(state)
+        return False
+
     log_live_event(
-        f"🔁 Перевыставляем SELL: ${float(price):.4f} "
-        f"(bid ${best_bid:.4f}, {SELL_AGGRESSIVE_TICKS} тик ниже)."
+        f"🔁 Выставляем SELL: ${float(price):.4f} "
+        f"(bid ${best_bid:.4f}, {aggressive_ticks} тик ниже)."
     )
 
     order = dict(requested_shares=shares, requested_price=float(price), submitted_at=time.time(),
@@ -1212,8 +1350,13 @@ def execute_sell_bond(secure_client: SecureClient, pos: Dict[str, Any], reason: 
                 raise RuntimeError("Неоднозначный отказ SELL; требуется сверка")
             pos["exit_orders"].pop()
             pos["execution_unknown"] = False
+            if is_take_profit:
+                pos.pop("take_profit_min_price", None)
+                pos.pop("exit_kind", None)
+                pos.pop("close_reason", None)
             save_live_state(state)
-            notify_live("🚨 <b>[LIVE] Защитная продажа отклонена.</b> Позиция остаётся открытой.")
+            if not is_take_profit:
+                notify_live("🚨 <b>[LIVE] Защитная продажа отклонена.</b> Позиция остаётся открытой.")
             return False
         if not order_id:
             raise ValueError("Ответ биржи без order_id")
@@ -1227,8 +1370,15 @@ def execute_sell_bond(secure_client: SecureClient, pos: Dict[str, Any], reason: 
         notify_live("🚨 <b>[LIVE] Продажа требует сверки.</b> Позиция не считается закрытой; повторная продажа заблокирована.")
         return False
     reconcile_position(secure_client, state, pos)
-    notify_live(f"🔴 <b>[LIVE] Заявка SELL принята</b>\n{format_market_link(pos['title'], pos.get('slug', ''))}\n"
-                f"Причина: {esc(reason)}\nОстаток позиции: {pos['shares']:.2f} акций.")
+    sell_header = (
+        "🟢 <b>[LIVE] Заявка Take-Profit SELL принята</b>"
+        if is_take_profit
+        else "🔴 <b>[LIVE] Заявка SELL принята</b>"
+    )
+    notify_live(
+        f"{sell_header}\n{format_market_link(pos['title'], pos.get('slug', ''))}\n"
+        f"Причина: {esc(reason)}\nОстаток позиции: {pos['shares']:.2f} акций."
+    )
     return pos.get("status") == "CLOSED"
 
 
@@ -1292,13 +1442,21 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                     log_live_event(f"⚠️ Нет bid для {pos['title'][:40]}; позиция не считается закрытой.")
 
                 m = find_market_for_pos(pos, [])
+                if m:
+                    if m.get("endDate") and not pos.get("end_date"):
+                        pos["end_date"] = m["endDate"]
+                    ev_id = extract_event_id(m)
+                    if ev_id and not pos.get("event_id"):
+                        pos["event_id"] = ev_id
                 pending_exit = any(not x.get("complete") for x in pos.get("exit_orders", []))
                 if pending_exit and (not m or not market_trading_finished(m)):
+                    tp_floor = pos.get("take_profit_min_price") if pos.get("exit_kind") == "take_profit" else None
                     execute_sell_bond(
                         secure_client,
                         pos,
                         pos.get("close_reason") or "сопровождение незаполненного SELL",
                         state,
+                        min_sell_price=tp_floor,
                     )
                     continue
                 if m and market_resolved(m) and pos.get("entry_terminal") and not pending_exit:
@@ -1316,6 +1474,11 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                     continue
                 if not m or market_trading_finished(m) or shares <= 0 or pending_exit:
                     continue
+                if summary and summary.get("best_bid") is not None:
+                    trigger_tp, tp_reason, tp_min_px = should_trigger_take_profit(pos, summary, m, now)
+                    if trigger_tp:
+                        execute_sell_bond(secure_client, pos, tp_reason, state, min_sell_price=tp_min_px)
+                        continue
                 streak = int(pos.get("ai_skip_streak", 0))
                 interval, prefer_cc, _reaudit_tier = compute_reaudit_plan(pos, m, now)
                 if now - float(pos.get("last_audit_ts", 0)) >= interval:
@@ -1409,7 +1572,7 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             return
 
         log_live_event("🔍 Сканирование рынков для Smart Bonding...")
-        candidates = scan_smart_bonding(markets, deposit_usd=slot_size)
+        candidates = scan_smart_bonding(markets, deposit_usd=slot_size, min_apr=BOND_MIN_ENTRY_APR)
         blocked_tokens = {
             p.get("token_id")
             for p in state.get("positions", [])
@@ -1423,18 +1586,46 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             and (p.get("status") == "OPEN" or now - float(p.get("closed_at", 0.0)) < REOPEN_COOLDOWN_SEC)
         }
 
+        markets_by_slug = {m.get("slug"): m for m in markets if m.get("slug")}
         active_open = [p for p in state.get("positions", []) if p.get("status") == "OPEN"]
+        blocked_event_ids: Set[str] = set()
+        long_open_count = 0
+        for p in active_open:
+            p_mkt = markets_by_slug.get(p.get("slug"))
+            ev_id = p.get("event_id") or extract_event_id(p_mkt)
+            if ev_id:
+                blocked_event_ids.add(ev_id)
+            p_days = _days_left_from_end_date(
+                str(p.get("end_date") or (p_mkt or {}).get("endDate") or ""), now
+            )
+            if p_days is not None and p_days > LONG_HORIZON_DAYS:
+                long_open_count += 1
+        max_long_slots = max(1, int(math.floor(max_slots * MAX_LONG_HORIZON_SHARE)))
+
         fresh_audits = 0
         for cand in candidates:
             if available_slots <= 0 or cash_balance < 10.0:
                 break
 
+            tier_req = get_entry_tier_requirements(len(active_open), max_slots)
+
             slug = cand.get("slug")
             if slug in blocked_slugs:
                 continue
 
-            m_cand = next((m for m in markets if m.get("slug") == slug), None)
+            m_cand = markets_by_slug.get(slug)
             if not m_cand:
+                continue
+
+            cand_event_id = cand.get("event_id") or extract_event_id(m_cand)
+            if cand_event_id and cand_event_id in blocked_event_ids:
+                continue
+            cand["event_id"] = cand_event_id
+
+            cand_days = float(cand.get("days_left") or 14.0)
+            if cand_days > tier_req["max_days"]:
+                continue
+            if cand_days > LONG_HORIZON_DAYS and long_open_count >= max_long_slots:
                 continue
 
             lead_outcome = cand.get("lead_outcome", "Yes")
@@ -1474,8 +1665,10 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             net_ret_pct = ((est_net_shares - slot_size) / slot_size) * 100.0 if slot_size > 0 else 0.0
             if net_ret_pct < MIN_NET_RETURN_PCT:
                 continue
-            cand["annualized_apr"] = net_ret_pct * (365.0 / max(1.0, float(cand.get("days_left", 14.0))))
+            cand["annualized_apr"] = net_ret_pct * (365.0 / max(1.0, cand_days))
             cand["estimated_entry_fee_usd"] = round(est_fee_usd, 4)
+            if cand["annualized_apr"] < tier_req["min_apr"]:
+                continue
 
             tick_now = time.time()
             audit = call_venice_market_audit(
@@ -1499,12 +1692,22 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                     f"{audit.get('decision')} ({audit.get('confidence', 0)}%) — {audit.get('summary')}"
                 )
 
-            if audit.get("decision") == "APPROVE":
+            audit_conf = int(audit.get("confidence") or 0)
+            if audit.get("decision") == "APPROVE" and audit_conf < tier_req["min_confidence"]:
+                log_live_event(
+                    f"⏭ Кандидат {cand['question'][:42]} пропущен по лестнице "
+                    f"[{tier_req['tier']}]: уверенность {audit_conf}% < {tier_req['min_confidence']}%."
+                )
+            elif audit.get("decision") == "APPROVE":
                 actual_slot = min(slot_size, cash_balance)
                 pos = execute_buy_bond(secure_client, cand, slot_size=actual_slot, state=state)
                 if pos:
                     if pos.get("status") == "OPEN":
                         active_open.append(pos)
+                        if cand_event_id:
+                            blocked_event_ids.add(cand_event_id)
+                        if cand_days > LONG_HORIZON_DAYS:
+                            long_open_count += 1
                     save_live_state(state)
                     cash_balance = get_live_cash_balance(clob_client, cfg)
                     state["available_cash_usd"] = cash_balance
@@ -1606,11 +1809,13 @@ def run_fast_stop_guard(cfg: Dict[str, str]) -> None:
                 if pending_exit:
                     m = find_market_for_pos(pos, [])
                     if not m or not market_trading_finished(m):
+                        tp_floor = pos.get("take_profit_min_price") if pos.get("exit_kind") == "take_profit" else None
                         execute_sell_bond(
                             _client(),
                             pos,
                             pos.get("close_reason") or "сопровождение незаполненного SELL",
                             state,
+                            min_sell_price=tp_floor,
                         )
                         state_changed = True
             except Exception as exc:
