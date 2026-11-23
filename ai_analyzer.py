@@ -44,8 +44,8 @@ _venice_cooldown_date: str = ""
 # Удлиненный кэш для отклонённых на входе рынков (SKIP), чтобы не тратить Venice каждые 6 ч на один и тот же рынок
 ENTRY_SKIP_CACHE_TTL_SEC = 24 * 3600.0
 ENTRY_HIGH_SKIP_CACHE_TTL_SEC = 36 * 3600.0
-# Компактный размер правил резолюции при плановом реаудите уже открытой позиции (правила проверены при входе и не меняются)
-REAUDIT_DESCRIPTION_MAX_CHARS = 800
+# Размер правил резолюции при плановом реаудите (достаточно для полных условий без обрезания важных исключений)
+REAUDIT_DESCRIPTION_MAX_CHARS = 2500
 # Максимальный возраст заголовков Google News RSS для резервного анализатора (дней)
 GOOGLE_NEWS_MAX_AGE_DAYS = 21
 
@@ -927,13 +927,17 @@ def call_venice_market_audit(
     end_date: str = "",
     stop_loss_price: float = 0.0,
     prefer_backup: bool = False,
+    consensus_mode: str = "unanimous_approve",
 ) -> Dict[str, Any]:
     """Вызывает Venice AI (с автоматическим failover на резервный Command Code) для аудита рынка.
 
-    samples > 1 — консенсус: APPROVE только если все выборки одобрили (сглаживает недетерминизм модели).
+    samples > 1 — консенсус:
+    - consensus_mode='unanimous_approve' (по умолчанию, для входа): APPROVE только если все модели одобрили;
+    - consensus_mode='unanimous_skip' (подтверждающий реаудит на выход): SKIP только если все модели вернули SKIP.
     prefer_backup=True — для спокойных 24ч-реаудитов сначала использует резервный Command Code (экономя Venice под входы).
-    При сбое обоих провайдеров или исчерпании обоих бюджетов строго соблюдается Fail-Closed (вход блокируется)."""
+    При сбое обоих провайдеров или исчерпании обоих бюджетов строго соблюдается Fail-Closed."""
     global _venice_cooldown_until, _venice_cooldown_date
+    eff_mode = "unanimous_skip" if consensus_mode == "unanimous_skip" else "unanimous_approve"
     cache_path = Path(cache_file) if cache_file else DEFAULT_AI_CACHE_FILE
     cache: Dict[str, Any] = {}
     if cache_path.exists():
@@ -948,7 +952,10 @@ def call_venice_market_audit(
         req_models = _order_consensus_models(req_models)
     web_mode = get_venice_web_search_mode()
 
-    cache_key = f"{strategy_type}::{outcome_label}::{question[:120]}"
+    if eff_mode == "unanimous_skip":
+        cache_key = f"{strategy_type}::{eff_mode}::{outcome_label}::{question[:120]}"
+    else:
+        cache_key = f"{strategy_type}::{outcome_label}::{question[:120]}"
     now = time.time()
     if cache_key in cache and cache_ttl_sec > 0:
         cached = cache[cache_key].get("result") or {}
@@ -968,6 +975,7 @@ def call_venice_market_audit(
                 and set(cached_models).issubset(set(models))
                 and cached.get("web_search") == web_mode
                 and cached.get("prompt_ver") == AUDIT_PROMPT_VERSION
+                and cached.get("consensus_mode", "unanimous_approve") == eff_mode
             ):
                 return cached
 
@@ -1190,28 +1198,60 @@ def call_venice_market_audit(
 
         update_ai_health(success=True, latency=vote["latency_sec"])
         votes.append(vote)
-        if vote["decision"] != "APPROVE":
-            break  # одного SKIP достаточно — экономим бюджет
+        if eff_mode == "unanimous_skip":
+            # На подтверждающем реаудите одного APPROVE достаточно, чтобы держать позицию и сэкономить 2-й вызов
+            if vote["decision"] == "APPROVE" or vote.get("raw_decision") != "SKIP":
+                break
+        else:
+            if vote["decision"] != "APPROVE":
+                break  # одного SKIP достаточно — экономим бюджет
 
-    skip_vote = next((v for v in votes if v["decision"] != "APPROVE"), None)
-    if skip_vote is None and len(votes) < len(req_models):
-        # Связь оборвалась до полного консенсуса. Принцип закрытого отказа (Fail-Closed): не входить вслепую
-        return {
-            "decision": "SKIP",
-            "confidence": 0,
-            "summary": f"Аварийный отказ (Fail-Closed): нет связи с ИИ ({last_err[:80]}). Вход строго заблокирован.",
-            "watch_keywords": [],
-            "emergency_mode": True,
-            "model_used": "none (circuit-breaker)",
-        }
+    if eff_mode == "unanimous_skip":
+        approve_vote = next((v for v in votes if v["decision"] == "APPROVE" or v.get("raw_decision") != "SKIP"), None)
+        if approve_vote is None and len(votes) < len(req_models):
+            # Второй голос не получен (сбой сети/лимита): НЕ ликвидируем позицию без полного консенсуса
+            return {
+                "decision": "APPROVE",
+                "raw_decision": "HOLD_UNCONFIRMED",
+                "confidence": 0,
+                "summary": f"Подтверждение выхода не получено ({last_err[:80]}); позиция остаётся под защитой Stop-Loss.",
+                "watch_keywords": [],
+                "emergency_mode": False,
+                "unanimous_skip": False,
+                "consensus_mode": eff_mode,
+                "model_used": "none (unconfirmed-exit)",
+            }
+        is_unanimous_skip = (
+            approve_vote is None
+            and len(votes) == len(req_models)
+            and all(v.get("raw_decision") == "SKIP" for v in votes)
+        )
+        chosen = approve_vote or min(votes, key=lambda v: v["confidence"])
+        final_decision = "SKIP" if is_unanimous_skip else "APPROVE"
+        final_raw_decision = "SKIP" if is_unanimous_skip else str(chosen.get("raw_decision") or "APPROVE")
+    else:
+        skip_vote = next((v for v in votes if v["decision"] != "APPROVE"), None)
+        if skip_vote is None and len(votes) < len(req_models):
+            # Связь оборвалась до полного консенсуса. Принцип закрытого отказа (Fail-Closed): не входить вслепую
+            return {
+                "decision": "SKIP",
+                "confidence": 0,
+                "summary": f"Аварийный отказ (Fail-Closed): нет связи с ИИ ({last_err[:80]}). Вход строго заблокирован.",
+                "watch_keywords": [],
+                "emergency_mode": True,
+                "model_used": "none (circuit-breaker)",
+            }
+        is_unanimous_skip = False
+        chosen = skip_vote or min(votes, key=lambda v: v["confidence"])
+        final_decision = "SKIP" if skip_vote else "APPROVE"
+        final_raw_decision = chosen.get("raw_decision", final_decision)
 
-    chosen = skip_vote or min(votes, key=lambda v: v["confidence"])
     unique_used = list(dict.fromkeys(v["model_used"] for v in votes))
     unique_req = list(dict.fromkeys(req_models))
     unique_providers = list(dict.fromkeys(v.get("provider", "venice") for v in votes))
     result = {
-        "decision": "SKIP" if skip_vote else "APPROVE",
-        "raw_decision": chosen.get("raw_decision", "SKIP" if skip_vote else "APPROVE"),
+        "decision": final_decision,
+        "raw_decision": final_raw_decision,
         "confidence": chosen["confidence"],
         "summary": chosen["summary"],
         "watch_keywords": chosen["watch_keywords"],
@@ -1221,6 +1261,8 @@ def call_venice_market_audit(
         "provider_used": " + ".join(unique_providers),
         "web_search": web_mode,
         "prompt_ver": AUDIT_PROMPT_VERSION,
+        "consensus_mode": eff_mode,
+        "unanimous_skip": is_unanimous_skip,
         "votes": [
             {"model": v["model_used"], "decision": v["decision"], "confidence": v["confidence"]}
             for v in votes

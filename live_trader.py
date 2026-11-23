@@ -47,6 +47,17 @@ from polymarket_scanner import (
 from live_execution import read_conditional_balance, read_execution
 from state_io import STATE_DIR, atomic_write_json, esc
 from telegram_notifier import send_telegram_alert
+from trade_analytics import (
+    extract_book_snapshot,
+    record_entry_cancelled,
+    record_entry_confirmed,
+    record_entry_rejected,
+    record_entry_submitted,
+    record_exit_triggered,
+    record_shadow_candidate,
+    record_trade_closed,
+    refresh_resolutions,
+)
 
 
 def format_market_link(title: str, slug: str = "") -> str:
@@ -80,7 +91,9 @@ BOND_STOP_LOSS_FLOOR = 0.8500     # Нижняя граница безопасн
 BOND_STOP_LOSS = 0.9500           # Резервный уровень для старых записей без цены входа
 MAX_ENTRY_PRICE = 0.9850
 MIN_ENTRY_PRICE = 0.9450
-MAX_ENTRY_SPREAD = 0.0150         # Макс. допустимый спред (best_ask - best_bid <= 1.5¢)
+MAX_ENTRY_SPREAD = 0.0120         # Абсолютный потолок спреда на входе (1.2¢)
+MAX_ENTRY_SPREAD_UPSIDE_SHARE = 0.40  # Спред не более 40% от валового апсайда (1.0 - ask), но не строже 1 тика
+BUY_STALE_CANCEL_AFTER_SEC = 180.0    # Незаполненный остаток BUY старше 3 мин отменяем (защита от зависших лимиток)
 MAX_SLOTS_PER_TOPIC = 2           # Лимит корреляции: макс. 2 открытые позиции на одну тему
 MAX_ENTRY_FEE_RATE = 0.06         # Допускаем геополитику (0), финансы/политику/техно (0.04), экономику/ФРС (0.05); отсекаем крипту (0.07)
 MIN_NET_RETURN_PCT = 0.30         # Минимальная чистая доходность к экспирации после комиссии (%)
@@ -99,7 +112,9 @@ MISSING_BUY_CONFIRM_SEC = 90.0    # Две сверки исчезнувшей �
 MISSING_BUY_MAX_GAP_SEC = 360.0
 SELL_REPLACE_AFTER_SEC = 60.0     # Незаполненный Stop-Loss SELL перевыставляем через минуту
 SELL_AGGRESSIVE_TICKS = 1         # На сколько тиков ниже best_bid ставить SELL для выкупа
-REAUDIT_EXIT_MIN_CONFIDENCE = 75  # Досрочный выход по реаудиту только при явном SKIP с уверенностью >= 75%
+REAUDIT_EXIT_MIN_CONFIDENCE = 75  # Порог SKIP для 1-го страйка и выхода при просадке цены >= 0.5¢
+REAUDIT_CALM_PRICE_EXIT_MIN_CONFIDENCE = 85  # При спокойной цене (просадка < 0.5¢) выход по 2/2 SKIP только от >= 85%
+REAUDIT_PRICE_CONFIRM_DROP = 0.0050          # Просадка >= 0.5¢ от входа считается рыночным подтверждением тревоги
 FAST_GUARD_INTERVAL_SEC = 20      # Быстрая проверка стаканов и Stop-Loss открытых позиций каждые 20 с
 MIN_ENTRY_BID_DEPTH_USD = 250.0   # Мин. живая глубина бидов в пределах 2¢ от best_bid для входа ($)
 BID_DEPTH_BAND = 0.0200           # Ширина полосы от best_bid для оценки ликвидности стакана на выход (2.0¢)
@@ -113,8 +128,15 @@ TAKE_PROFIT_MIN_DAYS_LEFT = 10.0      # Досрочный Take-Profit толь�
 TAKE_PROFIT_MAX_REM_APR = 20.0        # Take-Profit когда оставшийся APR к $1.00 упал ниже 20%
 TAKE_PROFIT_MIN_GAIN_CENTS = 0.0180   # Минимальный рост bid от входа (+1.8¢) для ротации
 TAKE_PROFIT_HIGH_BID = 0.9880         # Или достижение bid >= $0.988 с чистой прибылью после комиссий
+TAKE_PROFIT_ROTATION_MIN_FILL_RATIO = 0.80  # Ротационный TP только при заполненности слотов >= 80%
+TAKE_PROFIT_CEILING_BID = 0.9920      # Фиксация у потолка (>= $0.992, ост. апсайд <= 0.8¢) разрешена и при свободных слотах
 TAKE_PROFIT_MIN_NET_PROFIT_USD = 0.20 # Минимальная чистая прибыль ($) после комиссии SELL
 TAKE_PROFIT_MIN_NET_GAIN_PER_SHARE = 0.0030  # Минимум +0.3¢/акция чистыми после комиссии
+PROTECTIVE_SELL_MAX_SWEEP_OFFSET = 0.0300  # Макс. глубина пробития стакана вниз от best_bid на защитном SELL (3.0¢)
+DRAWDOWN_PAUSE_PCT = 5.0                   # Пауза новых входов при просадке >= 5.0% от LIVE_TOTAL_DEPOSIT от пика PnL
+DRAWDOWN_RESUME_PCT = 3.5                  # Снятие паузы при восстановлении просадки до <= 3.5% (гистерезис)
+REDEMPTION_CHECK_INTERVAL_SEC = 600.0      # Сверка авто-выкупа RESOLVED позиций на кошельке (не чаще раза в 10 мин)
+REDEMPTION_STALE_ALERT_SEC = 24 * 3600.0   # Алерт, если выигрышные токены не выкуплены спустя 24ч после резолюции
 
 TOPIC_CLUSTER_PATTERNS = {
     "iran_mideast": re.compile(
@@ -141,6 +163,38 @@ TOPIC_CLUSTER_PATTERNS = {
         r"\b(trump|hegseth|vance|musk|elon|white house|congress|senate|impeach)\b",
         re.IGNORECASE,
     ),
+    "macro_inflation_cb": re.compile(
+        r"\b(inflation|cpi|pce|recession|gdp|central bank|ecb|boj|bank of|selic|tariff|tariffs)\b",
+        re.IGNORECASE,
+    ),
+    "commodities_energy": re.compile(
+        r"\b(crude oil|wti|brent|gold|silver|natural gas|opec)\b",
+        re.IGNORECASE,
+    ),
+    "math_science_cmi": re.compile(
+        r"\b(riemann|millennium prize|clay mathematics|cmi)\b",
+        re.IGNORECASE,
+    ),
+    "entertainment_gaming": re.compile(
+        r"\b(gta\s*(?:vi|6)|rockstar|oscar|oscars|grammy|emmy)\b",
+        re.IGNORECASE,
+    ),
+}
+
+# Межтематические макро-бакеты риска: ограничивают суммарную концентрацию коррелированных слотов
+MACRO_RISK_BUCKETS = {
+    "geopolitics_us_pol": {
+        "clusters": {"iran_mideast", "russia_ukraine", "china_asia", "trump_us_pol"},
+        "max_slots": 5,
+    },
+    "macro_rates_economy": {
+        "clusters": {"fed_rates", "macro_inflation_cb", "commodities_energy"},
+        "max_slots": 4,
+    },
+    "tech_entertainment": {
+        "clusters": {"nvidia_huang", "entertainment_gaming"},
+        "max_slots": 3,
+    },
 }
 
 
@@ -167,6 +221,19 @@ def _days_left_from_end_date(end_str: str, now: Optional[float] = None) -> Optio
     return max(0.0, (end_dt.timestamp() - cur_now) / 86400.0)
 
 
+def max_allowed_entry_spread(best_ask: float, tick_size: Any = "0.01") -> float:
+    """Допустимый спред на входе: <= 1.2¢ и <= 40% от валового апсайда (но не строже 1 тика стакана)."""
+    try:
+        tick = float(tick_size)
+        if not math.isfinite(tick) or tick <= 0:
+            tick = 0.01
+    except (TypeError, ValueError):
+        tick = 0.01
+    upside = max(0.0, 1.0 - float(best_ask))
+    upside_cap = round(upside * MAX_ENTRY_SPREAD_UPSIDE_SHARE, 4)
+    return round(min(MAX_ENTRY_SPREAD, max(tick, upside_cap)), 4)
+
+
 def get_entry_tier_requirements(open_count: int, max_slots: int) -> Dict[str, Any]:
     """Лестница строгости входа по заполненности слотов (сохраняет резерв 20% под топ-перекосы)."""
     fill_ratio = float(open_count) / float(max(1, max_slots))
@@ -182,9 +249,13 @@ def should_trigger_take_profit(
     summary: Dict[str, Any],
     market: Optional[Dict[str, Any]] = None,
     now: Optional[float] = None,
+    slot_fill_ratio: Optional[float] = None,
 ) -> Tuple[bool, str, float]:
-    """Проверяет досрочную фиксацию прибыли (Take-Profit) для освобождения длинного слота.
+    """Проверяет досрочную фиксацию прибыли (Take-Profit).
 
+    - Ротационный TP (ост. APR < 20%): только при заполненности слотов >= 80%, чтобы не продавать
+      победителя в простаивающий кэш при свободных слотах.
+    - Потолочный TP (bid >= $0.992, ост. апсайд <= 0.8¢ на >= 10 дн.): разрешён при любой заполненности.
     Учитывает комиссию SELL и глубину бидов стакана; при неизвестном расписании комиссий не срабатывает."""
     if pos.get("status") != "OPEN" or not pos.get("entry_terminal"):
         return False, "", 0.0
@@ -218,6 +289,11 @@ def should_trigger_take_profit(
     if (sell_price - entry_price) < TAKE_PROFIT_MIN_GAIN_CENTS and sell_price < TAKE_PROFIT_HIGH_BID:
         return False, "", 0.0
 
+    is_ceiling_tp = sell_price >= (TAKE_PROFIT_CEILING_BID - 1e-9)
+    can_rotate = (slot_fill_ratio is None) or (float(slot_fill_ratio) + 1e-9 >= TAKE_PROFIT_ROTATION_MIN_FILL_RATIO)
+    if not is_ceiling_tp and not can_rotate:
+        return False, "", 0.0
+
     fee_sched = pos.get("fee_schedule")
     if not (isinstance(fee_sched, dict) and not fee_sched.get("unknown")):
         fee_sched = parse_fee_schedule(market) if isinstance(market, dict) else None
@@ -248,8 +324,9 @@ def should_trigger_take_profit(
     raw_min_px = (alloc / order_shares) + fee_per_share + min_unit_gain
     min_profitable_px = math.ceil(raw_min_px * 10000.0 - 1e-9) / 10000.0
     min_sell_price = round(min(sell_price, max(min_profitable_px, sell_price - 0.002)), 4)
+    mode_tag = "потолок" if is_ceiling_tp else "ротация"
     reason = (
-        f"Take-Profit: bid ${sell_price:.4f} (вход ${entry_price:.4f}, прибыль ~+${net_profit_usd:.2f}, "
+        f"Take-Profit ({mode_tag}): bid ${sell_price:.4f} (вход ${entry_price:.4f}, прибыль ~+${net_profit_usd:.2f}, "
         f"ост. APR {rem_apr:.1f}% на {days_left:.0f} дн.)"
     )
     return True, reason, min_sell_price
@@ -314,6 +391,153 @@ def _topic_cluster_blocked(
         if cnt >= max_per_topic:
             return cl
     return None
+
+
+def _macro_bucket_blocked(
+    question: str,
+    open_positions: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Возвращает имя переполненного макро-бакета риска (например, геополитика >= 5 слотов) или None."""
+    cand_clusters = _position_topic_clusters(question)
+    if not cand_clusters:
+        return None
+    for bucket_name, cfg in MACRO_RISK_BUCKETS.items():
+        b_clusters = cfg["clusters"]
+        if not (cand_clusters & b_clusters):
+            continue
+        cap = int(cfg["max_slots"])
+        cnt = 0
+        for p in open_positions:
+            p_text = f"{p.get('question', '')} {p.get('title', '')}"
+            if _position_topic_clusters(p_text) & b_clusters:
+                cnt += 1
+        if cnt >= cap:
+            return f"{bucket_name} ({cnt}/{cap})"
+    return None
+
+
+def update_and_check_drawdown_guard(
+    state: Dict[str, Any],
+    total_deposit: float,
+    now: Optional[float] = None,
+) -> Tuple[bool, float, float]:
+    """Обновляет пик кривой PnL (realized + unrealized) и включает/снимает паузу новых входов по просадке."""
+    ts = float(now if now is not None else time.time())
+    realized = float(state.get("realized_pnl_usd") or 0.0)
+    unrealized = sum(
+        float(p.get("unrealized_pnl_usd") or 0.0)
+        for p in state.get("positions", [])
+        if p.get("status") == "OPEN"
+    )
+    total_pnl = round(realized + unrealized, 4)
+    if "peak_total_pnl_usd" in state and state["peak_total_pnl_usd"] is not None:
+        peak = max(float(state["peak_total_pnl_usd"]), total_pnl)
+    else:
+        peak = max(0.0, total_pnl)
+    state["peak_total_pnl_usd"] = round(peak, 4)
+    dd_usd = max(0.0, round(peak - total_pnl, 4))
+    base = max(1.0, float(total_deposit))
+    dd_pct = round((dd_usd / base) * 100.0, 2)
+    state["current_drawdown_usd"] = dd_usd
+    state["current_drawdown_pct"] = dd_pct
+
+    was_paused = bool(state.get("drawdown_guard_paused"))
+    if not was_paused and dd_pct >= DRAWDOWN_PAUSE_PCT:
+        state["drawdown_guard_paused"] = True
+        state["drawdown_guard_since"] = ts
+        save_live_state(state)
+        log_live_event(
+            f"🛡 Drawdown Guard АКТИВИРОВАН: просадка -{dd_pct:.2f}% (-${dd_usd:.2f} от пика +${peak:.2f}). "
+            "Новые покупки на паузе; Stop-Loss и сопровождение работают штатно."
+        )
+        notify_live(
+            f"🛡 <b>{_live_badge()} DRAWDOWN GUARD АКТИВИРОВАН</b>\n\n"
+            f"📉 Просадка от пика PnL: <code>-{dd_pct:.2f}%</code> (<code>-${dd_usd:.2f}</code> от базы <code>${base:.0f}</code>)\n"
+            f"• Новые покупки приостановлены до восстановления просадки ниже <code>{DRAWDOWN_RESUME_PCT:.1f}%</code>.\n"
+            "• Сопровождение открытых позиций, 20-сек Stop-Loss и реаудиты продолжают работать."
+        )
+    elif was_paused and dd_pct <= DRAWDOWN_RESUME_PCT:
+        state["drawdown_guard_paused"] = False
+        state.pop("drawdown_guard_since", None)
+        save_live_state(state)
+        log_live_event(
+            f"✅ Drawdown Guard снят: просадка восстановилась до -{dd_pct:.2f}% (<= {DRAWDOWN_RESUME_PCT:.1f}%)."
+        )
+        notify_live(
+            f"✅ <b>{_live_badge()} DRAWDOWN GUARD СНЯТ</b>\n\n"
+            f"Просадка восстановилась до <code>-{dd_pct:.2f}%</code>. Новые входы снова разрешены."
+        )
+
+    return bool(state.get("drawdown_guard_paused")), dd_pct, dd_usd
+
+
+def compute_protective_sell_price(
+    summary: Dict[str, Any], shares: float
+) -> Tuple[Decimal, float]:
+    """Вычисляет depth-aware цену защитного SELL по уровням bids стакана (не глубже -3.0¢ от best_bid)."""
+    best_bid = float(summary["best_bid"])
+    tick_str = str(summary.get("tick_size") or "0.01")
+    try:
+        tick = Decimal(tick_str)
+        if tick <= 0:
+            tick = Decimal("0.01")
+    except InvalidOperation:
+        tick = Decimal("0.01")
+
+    bids = summary.get("bids") or []
+    sweep_price = best_bid
+    if bids and shares > 0:
+        cum = 0.0
+        for b_px, b_sz in bids:
+            sweep_price = float(b_px)
+            cum += float(b_sz)
+            if cum + 1e-9 >= shares:
+                break
+
+    floor_price = max(float(tick), best_bid - PROTECTIVE_SELL_MAX_SWEEP_OFFSET)
+    bounded_sweep = max(floor_price, min(best_bid, sweep_price))
+    raw_price = Decimal(str(bounded_sweep)) - tick * Decimal(SELL_AGGRESSIVE_TICKS)
+    final_price = _round_price_to_tick(float(max(Decimal(str(floor_price)), raw_price)), tick_str)
+    return final_price, sweep_price
+
+
+def check_pending_redemptions(
+    secure_client: SecureClient, state: Dict[str, Any], now: float
+) -> int:
+    """Read-only проверка кошелька для RESOLVED позиций с redemption_pending=True; снимает флаг при нулевом остатке."""
+    confirmed_cnt = 0
+    changed = False
+    for p in state.get("positions", []):
+        if p.get("status") != "RESOLVED" or not p.get("redemption_pending"):
+            continue
+        token_id = str(p.get("token_id") or "")
+        if not token_id:
+            continue
+        last_chk = float(p.get("redemption_checked_at") or 0.0)
+        if last_chk > 0.0 and (now - last_chk) < REDEMPTION_CHECK_INTERVAL_SEC:
+            continue
+        p["redemption_checked_at"] = now
+        changed = True
+        try:
+            bal = read_conditional_balance(secure_client, token_id)
+        except Exception:
+            continue
+        if bal <= Decimal("0.000001"):
+            p["redemption_pending"] = False
+            p["redemption_confirmed_at"] = now
+            confirmed_cnt += 1
+            log_live_event(f"✅ Выкуп (redeem) подтверждён на кошельке: {p.get('title', '')[:48]}")
+        elif float(p.get("current_price") or 0.0) >= 0.99:
+            closed_at = float(p.get("closed_at") or now)
+            if (now - closed_at) >= REDEMPTION_STALE_ALERT_SEC:
+                daemon_alerts.problem(
+                    f"redeem_stale_{p.get('id', 'pos')}",
+                    f"авто-выкуп задерживается >24ч: {p.get('title', '')[:35]}",
+                    f"на кошельке остаётся {bal} токенов",
+                )
+    if changed:
+        save_live_state(state)
+    return confirmed_cnt
 
 
 def outcome_price(m: Dict[str, Any], outcome: str, fallback: float) -> float:
@@ -1080,6 +1304,15 @@ def reconcile_position(client: SecureClient, state: Dict[str, Any], pos: Dict[st
             pos.update(status="CLOSED" if net_bought > 0 else "CANCELLED", closed_at=time.time(), unrealized_pnl_usd=0.0)
         settled = entry["settled"] and all(x["settled"] for x in exits)
         pos["reconciliation_pending"] = not settled
+        if entry["complete"] and net_bought > 0 and not pos.get("analytics_entry_logged"):
+            if record_entry_confirmed(pos, entry):
+                pos["analytics_entry_logged"] = True
+        if pos.get("status") == "CLOSED" and not pos.get("analytics_close_logged"):
+            if record_trade_closed(pos):
+                pos["analytics_close_logged"] = True
+        elif pos.get("status") == "CANCELLED" and not pos.get("analytics_close_logged"):
+            if record_entry_cancelled(pos):
+                pos["analytics_close_logged"] = True
         save_live_state(state)
         return settled
     except Exception as exc:
@@ -1188,8 +1421,11 @@ def execute_buy_bond(
     bid = summary.get("best_bid")
     if not MIN_ENTRY_PRICE <= ask <= MAX_ENTRY_PRICE:
         return None
-    if bid is None or (ask - float(bid)) > MAX_ENTRY_SPREAD:
-        log_live_event("⚠️ Новый вход пропущен: спред стакана шире 1.5¢ или отсутствует bid.")
+    eff_max_spread = max_allowed_entry_spread(ask, summary["tick_size"])
+    if bid is None or (ask - float(bid)) > eff_max_spread + 1e-9:
+        log_live_event(
+            f"⚠️ Новый вход пропущен: спред стакана шире {eff_max_spread * 100:.2f}¢ или отсутствует bid."
+        )
         return None
     if float(summary.get("near_bid_depth_usd") or 0.0) < MIN_ENTRY_BID_DEPTH_USD:
         log_live_event(
@@ -1199,6 +1435,12 @@ def execute_buy_bond(
     price = _round_price_to_tick(ask, summary["tick_size"])
     shares = math.floor(slot_size / float(price) * 100) / 100
     if shares < summary["min_order_size"] or shares <= 0:
+        return None
+    best_ask_size = float(summary.get("best_ask_size") or 0.0)
+    if best_ask_size + 1e-9 < shares:
+        log_live_event(
+            f"⚠️ Новый вход пропущен: объём на best_ask ({best_ask_size:.2f} акц.) меньше заявки ({shares:.2f} акц.)."
+        )
         return None
     est_fee_usd = estimate_taker_fee_usd(shares, float(price), fee_sched)
     est_net_shares = max(0.0, shares - (est_fee_usd / float(price)))
@@ -1220,12 +1462,17 @@ def execute_buy_bond(
         )
         return None
     now = time.time()
+    entry_book_snap = extract_book_snapshot(summary)
     pos = dict(id=f"live_bond_{token_id[:12]}_{time.time_ns()}", type="poly_bond", status="OPEN",
                opened_at=now, title=f"{candidate['question']} [{candidate['lead_outcome']}]",
                question=candidate["question"], slug=candidate.get("slug", ""),
                event_id=candidate.get("event_id", ""), end_date=candidate.get("end_date", ""),
                outcome=candidate["lead_outcome"], token_id=token_id,
                fee_schedule=fee_sched,
+               entry_book_snapshot=entry_book_snap,
+               entry_tier=str(candidate.get("entry_tier") or ""),
+               days_left_at_entry=round(float(final_days), 2),
+               topic_clusters=sorted(_position_topic_clusters(candidate.get("question", ""))),
                requested_shares=shares, requested_price=float(price), shares=0.0, allocated_usd=0.0,
                entry_price=float(price), current_price=float(price),
                stop_loss_price=round(max(BOND_STOP_LOSS_FLOOR, float(price) - BOND_STOP_LOSS_OFFSET), 4),
@@ -1244,18 +1491,21 @@ def execute_buy_bond(
                 raise RuntimeError("Неоднозначный отказ BUY; требуется сверка")
             pos.update(status="REJECTED", closed_at=time.time(), order_status="REJECTED", execution_unknown=False)
             save_live_state(state)
+            record_entry_rejected(pos, reason=err or "RejectedOrder")
             notify_live(f"⚠️ <b>[LIVE] Покупка отклонена</b>\n{format_market_link(pos['title'], pos['slug'])}")
             return None
         if not order_id:
             raise ValueError("Ответ биржи без order_id")
         pos.update(order_id=order_id, order_status=status, execution_unknown=False)
         save_live_state(state)
+        record_entry_submitted(pos, candidate, slot_size=slot_size, est_fee_usd=est_fee_usd)
     except Exception as exc:
         rejection = _buy_rejection_reason(exc)
         if rejection and not pos.get("order_id"):
             pos.update(status="REJECTED", closed_at=time.time(), order_status="REJECTED",
                        execution_unknown=False, reconciliation_pending=False, rejection_reason=rejection)
             save_live_state(state)
+            record_entry_rejected(pos, reason=rejection)
             log_live_event(f"⚠️ Биржа явно отклонила BUY: HTTP {exc.status}, {rejection}; слот свободен.")
             notify_live(f"⚠️ <b>[LIVE] Покупка отклонена</b>\n{format_market_link(pos['title'], pos['slug'])}\n"
                         f"Причина: <code>{esc(rejection)}</code>.")
@@ -1467,15 +1717,15 @@ def execute_sell_bond(
         return False
 
     best_bid = float(summary["best_bid"])
-    try:
-        tick = Decimal(str(summary["tick_size"]))
-        if tick <= 0:
-            tick = Decimal("0.01")
-    except InvalidOperation:
-        tick = Decimal("0.01")
-    aggressive_ticks = 0 if is_take_profit else SELL_AGGRESSIVE_TICKS
-    raw_price = Decimal(str(best_bid)) - tick * Decimal(aggressive_ticks)
-    price = _round_price_to_tick(float(max(tick, raw_price)), summary["tick_size"])
+    if is_take_profit:
+        price = _round_price_to_tick(best_bid, summary["tick_size"])
+        sweep_note = "TP по best_bid"
+    else:
+        price, sweep_px = compute_protective_sell_price(summary, shares)
+        if sweep_px < best_bid - 1e-9:
+            sweep_note = f"depth-aware sweep ${sweep_px:.4f} (пол -{PROTECTIVE_SELL_MAX_SWEEP_OFFSET*100:.1f}¢)"
+        else:
+            sweep_note = f"{SELL_AGGRESSIVE_TICKS} тик ниже bid"
 
     if is_take_profit:
         if float(price) + 1e-9 < float(min_sell_price):
@@ -1510,7 +1760,7 @@ def execute_sell_bond(
 
     log_live_event(
         f"🔁 Выставляем SELL: ${float(price):.4f} "
-        f"(bid ${best_bid:.4f}, {aggressive_ticks} тик ниже)."
+        f"(bid ${best_bid:.4f}, {sweep_note})."
     )
 
     order = dict(requested_shares=shares, requested_price=float(price), submitted_at=time.time(),
@@ -1539,7 +1789,14 @@ def execute_sell_bond(
             raise ValueError("Ответ биржи без order_id")
         order.update(order_id=order_id, status=status)
         pos["execution_unknown"] = False
+        if not pos.get("exit_trigger_snapshot"):
+            trig_snap = extract_book_snapshot(summary) or {}
+            trig_snap["ts"] = round(time.time(), 3)
+            trig_snap["requested_price"] = float(price)
+            trig_snap["stop_loss_price"] = pos_stop_loss_price(pos)
+            pos["exit_trigger_snapshot"] = trig_snap
         save_live_state(state)
+        record_exit_triggered(pos, order, summary=summary, reason=reason)
     except Exception as exc:
         pos["execution_unknown"] = True
         save_live_state(state)
@@ -1564,6 +1821,71 @@ def _is_cached_audit(audit: Dict[str, Any], tick_now: float) -> bool:
     if str(audit.get("model_used", "")).startswith("none"):
         return True
     return float(audit.get("audited_at") or 0.0) < tick_now
+
+
+def cancel_stale_buy_order(
+    secure_client: SecureClient,
+    state: Dict[str, Any],
+    pos: Dict[str, Any],
+    now: float,
+) -> bool:
+    """Отменяет зависший неисполненный остаток BUY старше BUY_STALE_CANCEL_AFTER_SEC (защита от adverse selection).
+
+    Возвращает True, если позиция после отмены перешла в терминальное состояние (CANCELLED или entry_terminal=True)."""
+    if pos.get("status") != "OPEN" or pos.get("entry_terminal") or not pos.get("order_id"):
+        return False
+    if any(not x.get("complete") for x in pos.get("exit_orders", [])):
+        return False
+    opened_at = float(pos.get("opened_at") or 0.0)
+    if opened_at <= 0.0 or (now - opened_at) < BUY_STALE_CANCEL_AFTER_SEC:
+        return False
+    last_try = float(pos.get("stale_buy_cancel_at") or 0.0)
+    if last_try > 0.0 and (now - last_try) < BUY_STALE_CANCEL_AFTER_SEC:
+        return False
+
+    pos["stale_buy_cancel_at"] = now
+    save_live_state(state)
+    order_id = str(pos["order_id"])
+    try:
+        secure_client.cancel_order(order_id=order_id)
+    except Exception as exc:
+        log_live_event(
+            f"⚠️ Не удалось отменить зависший остаток BUY {pos.get('title', '')[:40]}: "
+            f"{type(exc).__name__}: {' '.join(str(exc).split())[:140]}"
+        )
+    reconcile_position(secure_client, state, pos)
+    if pos.get("status") == "CANCELLED":
+        log_live_event(
+            f"🧹 Неисполненный BUY старше {int(BUY_STALE_CANCEL_AFTER_SEC)}с отменён: "
+            f"{pos.get('title', '')[:45]} (слот освобождён)."
+        )
+        return True
+    if pos.get("entry_terminal"):
+        log_live_event(
+            f"🧹 Зависший хвост BUY отменён: {pos.get('title', '')[:45]} "
+            f"(оставлено {float(pos.get('shares') or 0.0):.2f} из {float(pos.get('requested_shares') or 0.0):.2f} акций)."
+        )
+        return True
+    return False
+
+
+def _refresh_analytics_resolutions(
+    state: Dict[str, Any], active_slugs: Optional[Set[str]] = None
+) -> None:
+    """Фоновое (раз в 6 ч) обновление фактических резолюций для журнала и shadow-кандидатов."""
+    try:
+        res = refresh_resolutions(
+            state=state,
+            active_slugs=active_slugs,
+            fetcher=fetch_market_by_slug,
+        )
+        if not res.get("skipped") and res.get("newly_resolved", 0) > 0:
+            log_live_event(
+                f"📊 Аналитика: подтверждено новых резолюций: {res['newly_resolved']} "
+                f"(проверено {res['checked']}, в очереди {res.get('remaining_due', 0)})."
+            )
+    except Exception:
+        pass
 
 
 def run_live_tick(cfg: Dict[str, str]) -> None:
@@ -1640,6 +1962,12 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                         min_sell_price=tp_floor,
                     )
                     continue
+                if not pos.get("entry_terminal") and not pending_exit:
+                    cancel_stale_buy_order(secure_client, state, pos, now)
+                    if pos.get("status") != "OPEN":
+                        continue
+                    shares = float(pos.get("shares") or 0.0)
+                    entry_price = float(pos.get("entry_price") or entry_price)
                 if m and market_resolved(m) and pos.get("entry_terminal") and not pending_exit:
                     payout = outcome_price(m, pos.get("outcome", "Yes"), float("nan"))
                     if not math.isfinite(payout) or not 0 <= payout <= 1:
@@ -1649,6 +1977,9 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                                realized_pnl_usd=round(float(pos.get("realized_pnl_usd", 0)) + pnl, 6),
                                unrealized_pnl_usd=0.0, redemption_pending=True)
                     state["realized_pnl_usd"] = round(float(state.get("realized_pnl_usd", 0)) + pnl, 6)
+                    if not pos.get("analytics_close_logged"):
+                        if record_trade_closed(pos, payout=payout):
+                            pos["analytics_close_logged"] = True
                     save_live_state(state)
                     notify_live(f"🟢 <b>[LIVE] Рынок разрешён</b>\n{format_market_link(pos['title'], pos.get('slug', ''))}\n"
                                 f"Выплата: ${payout:.4f}/акция. Получение средств (redeem) отдельно не подтверждено.")
@@ -1656,24 +1987,44 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                 if not m or market_trading_finished(m) or shares <= 0 or pending_exit:
                     continue
                 if summary and summary.get("best_bid") is not None:
-                    trigger_tp, tp_reason, tp_min_px = should_trigger_take_profit(pos, summary, m, now)
+                    cur_open_cnt = sum(1 for p in state.get("positions", []) if p.get("status") == "OPEN")
+                    slot_fill_ratio = float(cur_open_cnt) / float(max(1, max_slots))
+                    trigger_tp, tp_reason, tp_min_px = should_trigger_take_profit(
+                        pos, summary, m, now, slot_fill_ratio=slot_fill_ratio
+                    )
                     if trigger_tp:
                         execute_sell_bond(secure_client, pos, tp_reason, state, min_sell_price=tp_min_px)
                         continue
                 streak = int(pos.get("ai_skip_streak", 0))
                 interval, prefer_cc, _reaudit_tier = compute_reaudit_plan(pos, m, now)
                 if now - float(pos.get("last_audit_ts", 0)) >= interval:
+                    is_confirming_exit = streak >= 1
+                    reaudit_samples = ENTRY_AI_SAMPLES if is_confirming_exit else 1
+                    reaudit_consensus = "unanimous_skip" if is_confirming_exit else "unanimous_approve"
                     audit = call_venice_market_audit(
                         question=pos.get("question") or pos["title"].split(" [")[0],
                         description=m.get("description", ""), price_yes=float(pos.get("current_price", entry_price)),
                         strategy_type="polymarket_smart_bonding_reaudit", outcome_label=pos.get("outcome", "Yes"),
+                        samples=reaudit_samples,
                         cache_ttl_sec=interval, end_date=m.get("endDate", ""), stop_loss_price=stop_px,
-                        prefer_backup=prefer_cc)
+                        prefer_backup=(False if is_confirming_exit else prefer_cc),
+                        consensus_mode=reaudit_consensus)
                     audited_at = float(audit.get("audited_at") or 0)
                     if audited_at and audited_at != float(pos.get("last_audit_ts", 0)):
                         raw_dec = str(audit.get("raw_decision") or audit.get("decision") or "").upper()
                         conf = int(audit.get("confidence") or 0)
-                        is_hard_exit_skip = (raw_dec == "SKIP" and conf >= REAUDIT_EXIT_MIN_CONFIDENCE)
+                        cur_px = float(pos.get("current_price") or entry_price)
+                        price_drop = max(0.0, round(entry_price - cur_px, 6)) if entry_price > 0 else 0.0
+                        if is_confirming_exit:
+                            req_exit_conf = (
+                                REAUDIT_EXIT_MIN_CONFIDENCE
+                                if price_drop >= REAUDIT_PRICE_CONFIRM_DROP
+                                else REAUDIT_CALM_PRICE_EXIT_MIN_CONFIDENCE
+                            )
+                            unanimous_ok = bool(audit.get("unanimous_skip")) if reaudit_samples > 1 else True
+                            is_hard_exit_skip = (raw_dec == "SKIP" and unanimous_ok and conf >= req_exit_conf)
+                        else:
+                            is_hard_exit_skip = (raw_dec == "SKIP" and conf >= REAUDIT_EXIT_MIN_CONFIDENCE)
                         pos.update(
                             last_audit_ts=audited_at,
                             ai_audit=audit,
@@ -1684,8 +2035,13 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                             log_live_event(
                                 f"⚠️ Реаудит [{pos['title'][:42]}]: SKIP ({conf}%, страйк {pos['ai_skip_streak']}/2) — {audit.get('summary')}"
                             )
+                        elif is_confirming_exit:
+                            log_live_event(
+                                f"ℹ️ Подтверждающий реаудит [{pos['title'][:42]}]: выход отменён "
+                                f"({raw_dec} {conf}%, просадка {price_drop*100:.2f}¢), держим позицию."
+                            )
                         if pos["ai_skip_streak"] >= 2:
-                            execute_sell_bond(secure_client, pos, f"ИИ дважды вернул SKIP: {audit.get('summary')}", state)
+                            execute_sell_bond(secure_client, pos, f"ИИ дважды вернул SKIP (2/2): {audit.get('summary')}", state)
             except Exception as exc:
                 reconciliation_ok = False
                 log_live_event(f"⚠️ Ошибка сопровождения {pos.get('title', '')[:40]}: {type(exc).__name__}; остальные позиции проверяются.")
@@ -1713,6 +2069,11 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
         open_count = len([p for p in state.get("positions", []) if p.get("status") == "OPEN"])
         available_slots = max_slots - open_count
 
+        try:
+            check_pending_redemptions(secure_client, state, now)
+        except Exception:
+            pass
+
         # Баланс читаем и сохраняем даже при 10/10: бот берёт available_cash_usd из state.
         try:
             clob_client = init_clob_client(cfg)
@@ -1729,16 +2090,27 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             )
             return
 
+        dd_paused, dd_pct, dd_usd = update_and_check_drawdown_guard(state, total_deposit, now)
+        if dd_paused:
+            log_live_event(
+                f"🛡 Новые входы на паузе (Drawdown Guard): просадка -{dd_pct:.2f}% (-${dd_usd:.2f})."
+            )
+            _refresh_analytics_resolutions(state)
+            return
+
         if available_slots <= 0:
             log_live_event(f"Слоты заполнены ({open_count}/{max_slots}). Поиск новых кандидатов пропущен.")
+            _refresh_analytics_resolutions(state)
             return
 
         if cash_balance < 10.0:
             log_live_event(f"⚠️ Доступный баланс (${cash_balance:.2f}) недостаточен для открытия слота ($10+).")
+            _refresh_analytics_resolutions(state)
             return
 
         if entry_budget_exhausted():
             log_live_event("Суточный лимит вызовов ИИ для новых входов исчерпан.")
+            _refresh_analytics_resolutions(state)
             return
 
         try:
@@ -1798,15 +2170,28 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             if not m_cand:
                 continue
 
+            cand_clusters = _position_topic_clusters(cand.get("question", ""))
             cand_event_id = cand.get("event_id") or extract_event_id(m_cand)
             if cand_event_id and cand_event_id in blocked_event_ids:
+                record_shadow_candidate(
+                    cand, stage="event_dedup", detail=f"event_id={cand_event_id}",
+                    tier_req=tier_req, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
             cand["event_id"] = cand_event_id
 
             cand_days = float(cand.get("days_left") or 14.0)
             if cand_days > tier_req["max_days"]:
+                record_shadow_candidate(
+                    cand, stage="tier_max_days", detail=f"{cand_days:.1f}d > {tier_req['max_days']}d",
+                    tier_req=tier_req, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
             if cand_days > LONG_HORIZON_DAYS and long_open_count >= max_long_slots:
+                record_shadow_candidate(
+                    cand, stage="long_horizon_cap", detail=f"long={long_open_count}/{max_long_slots}",
+                    tier_req=tier_req, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
 
             lead_outcome = cand.get("lead_outcome", "Yes")
@@ -1816,12 +2201,29 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             cand["token_id"] = token_id
 
             # Лимит корреляции: не более MAX_SLOTS_PER_TOPIC позиций в одном тематическом кластере (экономим DIEM)
-            if _topic_cluster_blocked(cand["question"], active_open):
+            blocked_cluster = _topic_cluster_blocked(cand["question"], active_open)
+            if blocked_cluster:
+                record_shadow_candidate(
+                    cand, stage="topic_cluster", detail=blocked_cluster,
+                    tier_req=tier_req, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
+                continue
+            # Межтематический макро-бакет корреляции (геополитика/US-политика, макро/ЦБ, техно/игры)
+            blocked_macro = _macro_bucket_blocked(cand["question"], active_open)
+            if blocked_macro:
+                record_shadow_candidate(
+                    cand, stage="macro_risk_bucket", detail=blocked_macro,
+                    tier_req=tier_req, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
 
             # Проверяем допустимость комиссии ДО чтения стакана и платного вызова Venice (экономим DIEM)
             fee_ok, fee_sched, _fee_reason = entry_fee_allowed(m_cand, token_id)
             if not fee_ok:
+                record_shadow_candidate(
+                    cand, stage="fee_blocked", detail=_fee_reason,
+                    tier_req=tier_req, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
             cand["fee_schedule"] = fee_sched
             cand["market"] = m_cand
@@ -1833,10 +2235,38 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             best_ask = float(summary["best_ask"])
             best_bid = float(summary["best_bid"])
             if best_ask > MAX_ENTRY_PRICE or best_ask < MIN_ENTRY_PRICE:
+                record_shadow_candidate(
+                    cand, stage="price_out_of_range", detail=f"ask={best_ask:.4f}",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
-            if (best_ask - best_bid) > MAX_ENTRY_SPREAD:
+            eff_max_spread = max_allowed_entry_spread(best_ask, summary["tick_size"])
+            if (best_ask - best_bid) > eff_max_spread + 1e-9:
+                record_shadow_candidate(
+                    cand, stage="wide_spread",
+                    detail=f"spread={(best_ask - best_bid)*100:.2f}c > {eff_max_spread*100:.2f}c",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    slot_size=slot_size, topic_clusters=cand_clusters,
+                )
+                continue
+            preview_slot = min(slot_size, cash_balance)
+            preview_shares = math.floor(preview_slot / best_ask * 100) / 100
+            if float(summary.get("best_ask_size") or 0.0) + 1e-9 < preview_shares:
+                record_shadow_candidate(
+                    cand, stage="thin_ask_depth",
+                    detail=f"ask_sz={float(summary.get('best_ask_size') or 0.0):.1f} < {preview_shares:.1f}",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
             if float(summary.get("near_bid_depth_usd") or 0.0) < MIN_ENTRY_BID_DEPTH_USD:
+                record_shadow_candidate(
+                    cand, stage="thin_bid_depth",
+                    detail=f"depth=${float(summary.get('near_bid_depth_usd') or 0.0):.0f}",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
 
             # Пересчитываем чистую доходность и APR по реальному best_ask за вычетом комиссии
@@ -1845,10 +2275,21 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
             est_net_shares = max(0.0, est_gross_shares - (est_fee_usd / best_ask))
             net_ret_pct = ((est_net_shares - slot_size) / slot_size) * 100.0 if slot_size > 0 else 0.0
             if net_ret_pct < MIN_NET_RETURN_PCT:
+                record_shadow_candidate(
+                    cand, stage="low_net_return", detail=f"net_ret={net_ret_pct:.2f}%",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
             cand["annualized_apr"] = net_ret_pct * (365.0 / max(1.0, cand_days))
             cand["estimated_entry_fee_usd"] = round(est_fee_usd, 4)
             if cand["annualized_apr"] < tier_req["min_apr"]:
+                record_shadow_candidate(
+                    cand, stage="tier_min_apr",
+                    detail=f"apr={cand['annualized_apr']:.1f}% < {tier_req['min_apr']}%",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 continue
 
             tick_now = time.time()
@@ -1874,17 +2315,44 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                 )
 
             audit_conf = int(audit.get("confidence") or 0)
-            if audit.get("decision") == "APPROVE" and audit_conf < tier_req["min_confidence"]:
+            is_ai_unavail = bool(
+                audit.get("budget_exhausted")
+                or audit.get("emergency_mode")
+                or str(audit.get("model_used") or "").startswith("none")
+            )
+            if audit.get("decision") != "APPROVE":
+                record_shadow_candidate(
+                    cand,
+                    stage="ai_unavailable" if is_ai_unavail else "ai_skip",
+                    detail=str(audit.get("summary") or "")[:160],
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    audit=audit, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
+            elif audit_conf < tier_req["min_confidence"]:
+                record_shadow_candidate(
+                    cand, stage="tier_min_confidence",
+                    detail=f"conf={audit_conf}% < {tier_req['min_confidence']}%",
+                    tier_req=tier_req, summary=summary, fee_sched=fee_sched,
+                    audit=audit, slot_size=slot_size, topic_clusters=cand_clusters,
+                )
                 log_live_event(
                     f"⏭ Кандидат {cand['question'][:42]} пропущен по лестнице "
                     f"[{tier_req['tier']}]: уверенность {audit_conf}% < {tier_req['min_confidence']}%."
                 )
-            elif audit.get("decision") == "APPROVE":
+            else:
+                cand["entry_tier"] = tier_req["tier"]
+                cand["open_slots_before"] = len(active_open)
+                cand["max_slots"] = max_slots
                 actual_slot = min(slot_size, cash_balance)
                 pos = execute_buy_bond(
                     secure_client, cand, slot_size=actual_slot, state=state, min_apr=tier_req["min_apr"]
                 )
                 if pos:
+                    record_shadow_candidate(
+                        cand, stage="entered", tier_req=tier_req, summary=summary,
+                        fee_sched=fee_sched, audit=audit, slot_size=actual_slot,
+                        topic_clusters=cand_clusters, pos_id=str(pos.get("id") or ""),
+                    )
                     if pos.get("status") == "OPEN":
                         active_open.append(pos)
                         if cand_event_id:
@@ -1899,6 +2367,12 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                     blocked_tokens.add(token_id)
                     blocked_slugs.add(slug)
                     time.sleep(2)
+                else:
+                    record_shadow_candidate(
+                        cand, stage="entry_exec_skipped", tier_req=tier_req, summary=summary,
+                        fee_sched=fee_sched, audit=audit, slot_size=actual_slot,
+                        topic_clusters=cand_clusters,
+                    )
 
             if pos_unknown(state):
                 break
@@ -1906,6 +2380,7 @@ def run_live_tick(cfg: Dict[str, str]) -> None:
                 break
 
         save_live_state(state)
+        _refresh_analytics_resolutions(state, active_slugs=set(markets_by_slug.keys()))
     finally:
         secure_client.close()
 

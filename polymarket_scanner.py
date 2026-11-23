@@ -493,7 +493,10 @@ def scan_smart_bonding(
 
         apr_capped = min(annualized_apr, 150.0)
         liq_factor = math.log10(max(book_liq, 10000.0))
-        quality_score = apr_capped * (float(risk_info["score"]) / 100.0) * liq_factor
+        # Коэффициент запаса доходности к риску стопа (-3.5¢): 95.5¢ (~1.13) выше 98.4¢ (~0.68)
+        gross_upside = max(0.005, 1.0 - lead_price)
+        upside_factor = min(1.20, max(0.55, (gross_upside / 0.035) ** 0.5))
+        quality_score = apr_capped * (float(risk_info["score"]) / 100.0) * liq_factor * upside_factor
 
         candidates.append({
             "question": m.get("question", ""),
