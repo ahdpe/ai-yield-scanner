@@ -47,6 +47,12 @@ PORTFOLIO_SORT_LABELS = {
     "pnl": "По PnL",
     "apr": "По APR",
 }
+AI_VERDICT_FILTERS = ("all", "entry", "reaudit")
+AI_VERDICT_HEADERS = {
+    "all": "🧠 <b>ПОСЛЕДНИЕ РЕШЕНИЯ ИИ</b>",
+    "entry": "🧠 <b>РЕШЕНИЯ ИИ · 🆕 НОВЫЕ ВХОДЫ</b>",
+    "reaudit": "🧠 <b>РЕШЕНИЯ ИИ · 🔄 РЕАУДИТЫ (HOLD)</b>",
+}
 
 
 def format_market_link(title: str, slug: str = "") -> str:
@@ -467,26 +473,73 @@ def format_emergency_msg() -> str:
     return "\n".join(msg)
 
 
-def format_ai_verdicts_msg() -> str:
-    """Показывает 8 самых свежих вердиктов Venice AI, отсортированных по времени."""
+def _is_reaudit_strategy(strat: str) -> bool:
+    """Возвращает True, если ключ кэша относится к реаудиту уже открытой позиции."""
+    return "reaudit" in (strat or "").lower()
+
+
+def _parse_ai_callback(data: str) -> str:
+    """Безопасно разбирает callback вида ai:<filter> (all|entry|reaudit)."""
+    parts = (data or "").split(":")
+    mode = parts[1] if len(parts) >= 2 else "all"
+    return mode if mode in AI_VERDICT_FILTERS else "all"
+
+
+def make_ai_verdicts_keyboard(mode: str = "all") -> dict:
+    """Клавиатура экрана решений ИИ с фильтром Все / Входы / Реаудиты."""
+    cur_mode = mode if mode in AI_VERDICT_FILTERS else "all"
+    labels = [
+        ("all", "Все"),
+        ("entry", "🆕 Входы"),
+        ("reaudit", "🔄 Реаудиты"),
+    ]
+    filter_row = [
+        {
+            "text": f"• {label} •" if key == cur_mode else label,
+            "callback_data": f"ai:{key}",
+        }
+        for key, label in labels
+    ]
+    return make_main_keyboard(extra_rows=[filter_row], refresh_cb=f"ai:{cur_mode}")
+
+
+def format_ai_verdicts_view(mode: str = "all") -> Tuple[str, dict]:
+    """Показывает 8 самых свежих вердиктов ИИ с пометкой типа проверки и фильтром."""
+    cur_mode = mode if mode in AI_VERDICT_FILTERS else "all"
+    kb = make_ai_verdicts_keyboard(cur_mode)
+    header = AI_VERDICT_HEADERS[cur_mode]
+
     if not AI_CACHE_FILE.exists():
-        return "🧠 <b>Журнал аудитов ИИ пока пуст.</b>"
+        return f"{header}\n\n<i>Журнал аудитов ИИ пока пуст.</i>", kb
 
     try:
         cache = json.loads(AI_CACHE_FILE.read_text(encoding="utf-8"))
     except Exception as exc:
-        return f"⚠️ Ошибка чтения кэша ИИ: {esc(exc)}"
+        return f"⚠️ Ошибка чтения кэша ИИ: {esc(exc)}", kb
 
     if not cache:
-        return "🧠 <b>Журнал аудитов ИИ пока пуст.</b>"
+        return f"{header}\n\n<i>Журнал аудитов ИИ пока пуст.</i>", kb
+
+    filtered_items = []
+    for key, data in cache.items():
+        strat = key.split("::", 1)[0] if key else ""
+        is_reaudit = _is_reaudit_strategy(strat)
+        if cur_mode == "entry" and is_reaudit:
+            continue
+        if cur_mode == "reaudit" and not is_reaudit:
+            continue
+        filtered_items.append((key, data))
+
+    if not filtered_items:
+        return f"{header}\n\n<i>Записей для этого фильтра пока нет.</i>", kb
 
     sorted_items = sorted(
-        cache.items(),
+        filtered_items,
         key=lambda kv: float((kv[1] or {}).get("ts") or (kv[1] or {}).get("result", {}).get("audited_at") or 0.0),
         reverse=True,
     )[:8]
 
-    msg: List[str] = ["🧠 <b>ПОСЛЕДНИЕ РЕШЕНИЯ VENICE AI</b>\n"]
+    msg: List[str] = [f"{header}\n"]
     for key, data in sorted_items:
         parts = key.split("::")
         strat = parts[0] if parts else "unknown"
@@ -503,15 +556,31 @@ def format_ai_verdicts_msg() -> str:
         used_m = str(res.get("model_used") or "")
         m_tag = f" | <code>{esc(used_m)}</code>" if used_m else ""
 
+        if _is_reaudit_strategy(strat):
+            if dec == "APPROVE":
+                kind_tag = "🔄 Реаудит (HOLD)"
+            elif dec == "SKIP":
+                kind_tag = "🔄 Реаудит (угроза)"
+            else:
+                kind_tag = "🔄 Реаудит"
+        else:
+            kind_tag = "🆕 Новый вход"
+
         block = (
-            f"{dec_icon} <b>{esc(dec)} ({conf}%)</b> | <i>{esc(ts_str)}</i>{m_tag}\n"
+            f"{dec_icon} <b>{esc(dec)} ({conf}%)</b> · {kind_tag} | <i>{esc(ts_str)}</i>{m_tag}\n"
             f"<b>{esc(q)}</b>{out_tag}\n"
             f"<i>\"{esc(summary[:180])}\"</i>\n"
         )
         if not _append_bounded(msg, block):
             break
 
-    return "\n".join(msg)
+    return "\n".join(msg), kb
+
+
+def format_ai_verdicts_msg(mode: str = "all") -> str:
+    """Возвращает текст экрана последних вердиктов ИИ (совместимость)."""
+    text, _kb = format_ai_verdicts_view(mode)
+    return text
 
 
 def format_logs_msg() -> str:
@@ -677,7 +746,8 @@ class SimpleTelegramBot:
                             pf_text, pf_kb = format_portfolio_page(view="open", sort_mode="def", page=0)
                             self.send_menu(chat_id, pf_text, reply_markup=pf_kb)
                         elif text in ("/ai", "/verdicts"):
-                            self.send_menu(chat_id, format_ai_verdicts_msg())
+                            ai_text, ai_kb = format_ai_verdicts_view("all")
+                            self.send_menu(chat_id, ai_text, reply_markup=ai_kb)
                         elif text in ("/emergency", "/safe"):
                             self.send_menu(chat_id, format_emergency_msg())
                         elif text == "/ping":
@@ -721,7 +791,13 @@ class SimpleTelegramBot:
                             self.answer_callback(cb_id)
                         elif data == "menu_ai":
                             self.answer_callback(cb_id)
-                            self.send_menu(chat_id, format_ai_verdicts_msg())
+                            ai_text, ai_kb = format_ai_verdicts_view("all")
+                            self.send_menu(chat_id, ai_text, reply_markup=ai_kb)
+                        elif data.startswith("ai:"):
+                            mode = _parse_ai_callback(data)
+                            ai_text, ai_kb = format_ai_verdicts_view(mode)
+                            self.answer_callback(cb_id)
+                            self.edit_menu(chat_id, msg_obj.get("message_id"), ai_text, reply_markup=ai_kb)
                         elif data == "menu_emergency":
                             self.answer_callback(cb_id)
                             self.send_menu(chat_id, format_emergency_msg())
